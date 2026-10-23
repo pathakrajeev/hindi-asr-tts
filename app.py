@@ -443,13 +443,6 @@ def render_metrics_dashboard(
 st.title("🗣️ Hindi Live ASR → TTS")
 st.caption("Koyal Hindi ASR 120M → Sarvam Bulbul v3. Uploaded audio and reference text are not retained.")
 
-if "last_live_file" not in st.session_state:
-    st.session_state.last_live_file = None
-if "last_research_file" not in st.session_state:
-    st.session_state.last_research_file = None
-if "last_reference_file" not in st.session_state:
-    st.session_state.last_reference_file = None
-
 tabs = st.tabs(["Live Processing", "Research Mode", "📚 Project Overview"])
 
 with tabs[2]:
@@ -561,6 +554,16 @@ with tabs[0]:
                     hide_index=True,
                     use_container_width=True,
                 )
+                render_metrics_dashboard(
+                    audio,
+                    sample_rate,
+                    generated_wav,
+                    transcript,
+                    input_seconds,
+                    asr_seconds,
+                    tts_seconds,
+                    generated_seconds,
+                )
             except Exception as exc:
                 st.error(f"Processing failed: {type(exc).__name__}: {exc}")
     else:
@@ -610,7 +613,7 @@ with tabs[1]:
                     hide_index=True,
                     use_container_width=True,
                 )
-                render_research_analysis(
+                render_metrics_dashboard(
                     audio,
                     sample_rate,
                     generated_wav,
