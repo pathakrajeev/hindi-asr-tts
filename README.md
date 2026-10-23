@@ -124,6 +124,10 @@ See [SECURITY.md](SECURITY.md) for deployment guides (Streamlit Cloud, Docker, s
 - Ensure `.env` has your Sarvam API key
 - Check that your API key is active on https://console.sarvam.ai/
 
+### `No module named 'torchvision'` in Streamlit logs
+- This can be a file-watcher warning while Streamlit inspects Transformers' optional image-processing modules; audio transcription does not require `torchvision`.
+- The app disables the file watcher to avoid this warning. Automatic app reloads after code changes are also disabled, so restart Streamlit after editing files.
+
 ### Memory error during transcription
 - Close other applications to free RAM
 - The app uses float16 precision to minimize memory usage

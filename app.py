@@ -213,6 +213,46 @@ def score_transcript(reference_text: str, transcript: str) -> dict[str, float | 
     }
 
 
+def word_error_breakdown(reference_text: str, transcript: str) -> dict[str, int]:
+    reference = normalize_reference_text(reference_text).split()
+    hypothesis = normalize_reference_text(transcript).split()
+    previous = [(index, 0, 0, index) for index in range(len(hypothesis) + 1)]
+
+    for ref_index, ref_word in enumerate(reference, start=1):
+        current = [(ref_index, 0, ref_index, 0)]
+        for hyp_index, hyp_word in enumerate(hypothesis, start=1):
+            is_substitution = ref_word != hyp_word
+            candidates = (
+                (
+                    previous[hyp_index - 1][0] + is_substitution,
+                    previous[hyp_index - 1][1] + is_substitution,
+                    previous[hyp_index - 1][2],
+                    previous[hyp_index - 1][3],
+                ),
+                (
+                    previous[hyp_index][0] + 1,
+                    previous[hyp_index][1],
+                    previous[hyp_index][2] + 1,
+                    previous[hyp_index][3],
+                ),
+                (
+                    current[hyp_index - 1][0] + 1,
+                    current[hyp_index - 1][1],
+                    current[hyp_index - 1][2],
+                    current[hyp_index - 1][3] + 1,
+                ),
+            )
+            current.append(min(candidates, key=lambda counts: counts[0]))
+        previous = current
+
+    _, substitutions, deletions, insertions = previous[-1]
+    return {
+        "Substitutions": substitutions,
+        "Deletions": deletions,
+        "Insertions": insertions,
+    }
+
+
 def audio_summary(audio: np.ndarray, sample_rate: int, text: str) -> dict[str, float | int]:
     duration = len(audio) / sample_rate
     peak = float(np.max(np.abs(audio)))
@@ -236,7 +276,7 @@ def audio_summary(audio: np.ndarray, sample_rate: int, text: str) -> dict[str, f
     }
 
 
-def render_research_analysis(
+def render_metrics_dashboard(
     input_audio: np.ndarray,
     input_rate: int,
     generated_wav: bytes,
@@ -245,7 +285,7 @@ def render_research_analysis(
     asr_seconds: float,
     tts_seconds: float,
     generated_seconds: float,
-    reference_text: str,
+    reference_text: str | None = None,
 ) -> None:
     generated_audio, generated_rate = sf.read(
         io.BytesIO(generated_wav), dtype="float32", always_2d=False
@@ -255,28 +295,42 @@ def render_research_analysis(
 
     input_metrics = audio_summary(input_audio, input_rate, transcript)
     generated_metrics = audio_summary(generated_audio, int(generated_rate), transcript)
-    asr_scores = score_transcript(reference_text, transcript)
 
-    st.subheader("🔬 Research Analysis")
-    st.caption("Detailed ASR/TTS evaluation with WER/CER metrics and audio analysis.")
+    st.subheader("📊 Speech metrics and charts")
+    if reference_text is None:
+        st.caption("Live audio, speech, and pipeline measurements. Reference-based ASR scores are available in evaluation mode.")
+    else:
+        st.caption("Reference-based ASR accuracy, audio diagnostics, prosody, and pipeline performance.")
 
-    analysis_tabs = st.tabs(["ASR Accuracy", "Audio Metrics", "Spectrograms", "Pipeline Performance"])
+    analysis_tabs = (
+        st.tabs(["ASR Accuracy", "Audio Metrics", "Audio Diagnostics", "Prosody", "Pipeline Performance"])
+        if reference_text is not None
+        else st.tabs(["Audio Metrics", "Audio Diagnostics", "Prosody", "Pipeline Performance"])
+    )
 
-    with analysis_tabs[0]:
-        st.write(f"**Transcript**: {len(transcript.split())} words, {len(transcript)} characters")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            wer = asr_scores['WER (%)']
-            st.metric("WER (%)", f"{wer:.2f}", delta=f"Reference: {asr_scores['Reference words']} words" if wer < 20 else "Higher error", delta_color="inverse")
-        with col2:
-            cer = asr_scores['CER (%)']
-            st.metric("CER (%)", f"{cer:.2f}", delta=f"Ref: {asr_scores['Reference characters']} chars" if cer < 20 else "Higher error", delta_color="inverse")
-        with col3:
-            st.metric("Ref Words", asr_scores["Reference words"])
-        with col4:
-            st.metric("Ref Chars", asr_scores["Reference characters"])
+    if reference_text is not None:
+        asr_scores = score_transcript(reference_text, transcript)
+        error_counts = word_error_breakdown(reference_text, transcript)
+        with analysis_tabs[0]:
+            st.write(f"**Transcript**: {len(transcript.split())} words, {len(transcript)} characters")
+            columns = st.columns(4)
+            columns[0].metric("WER (%)", f"{asr_scores['WER (%)']:.2f}", delta_color="inverse")
+            columns[1].metric("CER (%)", f"{asr_scores['CER (%)']:.2f}", delta_color="inverse")
+            columns[2].metric("Reference words", asr_scores["Reference words"])
+            columns[3].metric("Reference characters", asr_scores["Reference characters"])
 
-    with analysis_tabs[1]:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+            axes[0].bar(["WER", "CER"], [asr_scores["WER (%)"], asr_scores["CER (%)"]], color=["#0F766E", "#5B8C85"])
+            axes[0].set(title="ASR reference error rates", ylabel="Error rate (%)")
+            axes[0].grid(axis="y", alpha=0.25)
+            axes[1].barh(list(error_counts), list(error_counts.values()), color=["#C66B3D", "#D6A84F", "#637A9A"])
+            axes[1].set(title="Word error counts", xlabel="Count")
+            axes[1].grid(axis="x", alpha=0.25)
+            st.pyplot(fig, alt="Bar charts of word error rate, character error rate, and substitution, deletion, and insertion counts")
+            plt.close(fig)
+
+    metrics_tab = 1 if reference_text is not None else 0
+    with analysis_tabs[metrics_tab]:
         st.caption("Words per minute, spectral centroid, zero-crossing rate, and RMS/Peak levels.")
         metric_df = [
             {
@@ -287,62 +341,114 @@ def render_research_analysis(
             }
             for measure, input_value in input_metrics.items()
         ]
-        st.dataframe(metric_df, hide_index=True, use_container_width=True)
+        st.dataframe(metric_df, hide_index=True, width="stretch")
 
-    with analysis_tabs[2]:
+    diagnostics_tab = metrics_tab + 1
+    with analysis_tabs[diagnostics_tab]:
         fig, axes = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
-        fig.patch.set_facecolor('white')
-
-        for idx, (audio, sample_rate, label, waveform_axis, spectrum_axis) in enumerate((
-            (input_audio, input_rate, "🎙️ Input Speech", axes[0, 0], axes[1, 0]),
-            (generated_audio, int(generated_rate), "🔊 Generated Speech", axes[0, 1], axes[1, 1]),
-        )):
-            stride = max(1, int(np.ceil(len(audio) / 3000)))
+        signals = (
+            (input_audio, input_rate, "Input speech", axes[0, 0], axes[1, 0], "#0F766E"),
+            (generated_audio, int(generated_rate), "Generated speech", axes[0, 1], axes[1, 1], "#C66B3D"),
+        )
+        for audio, sample_rate, label, waveform_axis, spectrum_axis, color in signals:
+            stride = max(1, int(np.ceil(len(audio) / 5000)))
             waveform = audio[::stride]
-            waveform_axis.plot(np.arange(len(waveform)) * stride / sample_rate, waveform, linewidth=0.7, color='#1f77b4')
-            waveform_axis.set(title=f"{label} Waveform", xlabel="Time (s)", ylabel="Amplitude")
+            waveform_axis.plot(np.arange(len(waveform)) * stride / sample_rate, waveform, linewidth=0.7, color=color)
+            waveform_axis.set(title=f"{label} waveform", xlabel="Time (s)", ylabel="Amplitude")
             waveform_axis.grid(True, alpha=0.3)
 
-            spectrum = np.abs(librosa.stft(audio, n_fft=512, hop_length=128, pad_mode="constant"))
-            spectrum_db = librosa.amplitude_to_db(spectrum, ref=np.max)
+            mel = librosa.feature.melspectrogram(
+                y=audio, sr=sample_rate, n_fft=512, hop_length=160, n_mels=64
+            )
+            spectrum_db = librosa.power_to_db(mel, ref=np.max)
             image = librosa.display.specshow(
                 spectrum_db,
                 sr=sample_rate,
-                hop_length=128,
+                hop_length=160,
                 x_axis="time",
-                y_axis="hz",
+                y_axis="mel",
                 ax=spectrum_axis,
-                cmap='viridis',
+                cmap="viridis",
             )
-            spectrum_axis.set(title=f"{label} Spectrogram", xlabel="Time (s)", ylabel="Frequency (Hz)")
+            spectrum_axis.set(title=f"{label} log-Mel spectrogram", xlabel="Time (s)", ylabel="Mel frequency")
             fig.colorbar(image, ax=spectrum_axis, format="%+2.0f dB")
 
-        st.pyplot(fig, use_container_width=True)
+        st.pyplot(fig, alt="Input and generated speech waveforms and log-Mel spectrograms")
+        plt.close(fig)
 
-    with analysis_tabs[3]:
-        st.markdown("### Pipeline Performance")
-        perf_data = {
-            "Stage": ["ASR (Koyal)", "TTS (Bulbul)"],
-            "Processing Time (s)": [round(asr_seconds, 2), round(tts_seconds, 2)],
-            "Audio Duration (s)": [round(input_seconds, 2), round(generated_seconds, 2)],
-            "Real-Time Factor": [
-                round(asr_seconds / input_seconds, 3) if input_seconds else 0.0,
-                round(tts_seconds / generated_seconds, 3) if generated_seconds else 0.0,
-            ],
-        }
-        st.dataframe(perf_data, hide_index=True, use_container_width=True)
+    prosody_tab = diagnostics_tab + 1
+    with analysis_tabs[prosody_tab]:
+        fig, axes = plt.subplots(2, 1, figsize=(12, 7), constrained_layout=True)
+        for audio, sample_rate, label, color in (
+            (input_audio, input_rate, "Input speech", "#0F766E"),
+            (generated_audio, int(generated_rate), "Generated speech", "#C66B3D"),
+        ):
+            hop_length = 256
+            f0 = librosa.yin(
+                audio,
+                fmin=65,
+                fmax=min(500, sample_rate / 2 - 1),
+                sr=sample_rate,
+                frame_length=1024,
+                hop_length=hop_length,
+            )
+            rms = librosa.feature.rms(
+                y=audio, frame_length=1024, hop_length=hop_length
+            )[0]
+            frame_count = min(len(f0), len(rms))
+            times = librosa.frames_to_time(
+                np.arange(frame_count), sr=sample_rate, hop_length=hop_length
+            )
+            voiced_f0 = np.where(rms[:frame_count] > max(float(np.max(rms)) * 0.02, 1e-5), f0[:frame_count], np.nan)
+            axes[0].plot(times, voiced_f0, linewidth=0.8, label=label, color=color)
+            axes[1].plot(
+                times,
+                20 * np.log10(np.maximum(rms[:frame_count], 1e-8)),
+                linewidth=0.8,
+                label=label,
+                color=color,
+            )
+        axes[0].set(title="Estimated pitch contour", ylabel="Pitch (Hz)")
+        axes[1].set(title="Frame energy contour", xlabel="Time (s)", ylabel="RMS (dBFS)")
+        for axis in axes:
+            axis.grid(True, alpha=0.25)
+            axis.legend()
+        st.caption("Pitch is estimated with YIN and masked during low-energy frames; it is descriptive, not a voice-quality score.")
+        st.pyplot(fig, alt="Estimated pitch and RMS energy contours for the input and generated speech")
+        plt.close(fig)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            total_time = asr_seconds + tts_seconds
-            total_audio = input_seconds + generated_seconds
-            st.metric("Total Processing (s)", f"{total_time:.2f}")
-        with col2:
-            st.metric("Combined RTF", f"{(total_time / total_audio):.3f}" if total_audio > 0 else "N/A")
+    with analysis_tabs[prosody_tab + 1]:
+        asr_rtf = asr_seconds / input_seconds if input_seconds else 0.0
+        tts_rtf = tts_seconds / generated_seconds if generated_seconds else 0.0
+        total_time = asr_seconds + tts_seconds
+        total_audio = input_seconds + generated_seconds
+        columns = st.columns(3)
+        columns[0].metric("Total processing (s)", f"{total_time:.2f}")
+        columns[1].metric("ASR real-time factor", f"{asr_rtf:.3f}", help="ASR processing time divided by input audio duration; lower is faster.")
+        columns[2].metric("TTS real-time factor", f"{tts_rtf:.3f}", help="TTS processing time divided by generated audio duration; lower is faster.")
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+        axes[0].barh(["ASR (Koyal)", "TTS (Bulbul)"], [asr_seconds, tts_seconds], color=["#0F766E", "#C66B3D"])
+        axes[0].set(title="Processing latency", xlabel="Seconds")
+        axes[1].barh(["ASR (Koyal)", "TTS (Bulbul)"], [asr_rtf, tts_rtf], color=["#0F766E", "#C66B3D"])
+        axes[1].axvline(1, color="gray", linestyle="--", linewidth=1, label="Real-time")
+        axes[1].set(title="Real-time factor", xlabel="Processing time / audio duration")
+        axes[1].legend()
+        for axis in axes:
+            axis.grid(axis="x", alpha=0.25)
+        st.pyplot(fig, alt="Horizontal bars compare ASR and TTS latency and real-time factor; lower values are faster")
+        plt.close(fig)
 
 
 st.title("🗣️ Hindi Live ASR → TTS")
 st.caption("Koyal Hindi ASR 120M → Sarvam Bulbul v3. Uploaded audio and reference text are not retained.")
+
+if "last_live_file" not in st.session_state:
+    st.session_state.last_live_file = None
+if "last_research_file" not in st.session_state:
+    st.session_state.last_research_file = None
+if "last_reference_file" not in st.session_state:
+    st.session_state.last_reference_file = None
 
 tabs = st.tabs(["Live Processing", "Research Mode", "📚 Project Overview"])
 
@@ -424,6 +530,7 @@ with tabs[0]:
         upload = st.file_uploader("Or upload audio", type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"], key="live_upload")
 
     source = recording or upload
+
     if source is not None:
         raw = source.getvalue()
         suffix = Path(getattr(source, "name", "recording.wav")).suffix or ".wav"
