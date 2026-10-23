@@ -1,0 +1,10 @@
+streamlit>=1.42,<2
+torch>=2.5
+nemo_toolkit[asr]>=3.0,<4
+huggingface_hub>=0.27
+librosa>=0.10
+matplotlib>=3.7
+soundfile>=0.12
+requests>=2.31
+numpy>=1.26
+python-dotenv>=1.0,<2
