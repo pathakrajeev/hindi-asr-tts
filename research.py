@@ -188,6 +188,7 @@ def load_utmos():
 
 
 RELEASERS = {
+    "koyal": load_koyal,
     "whisper-large-v3-turbo": load_whisper,
     "indic-conformer-ctc": load_indic_conformer,
     "indic-conformer-rnnt": load_indic_conformer,
@@ -705,7 +706,7 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
             else:
                 row |= score_transcript(reference_text, row["text"])
         asr_rows.append(row)
-        if options["release"] and key != options["judge"]:
+        if options["release"]:
             release(key)
 
     tts_text, source = reference_text, "Reference transcript"
@@ -1094,7 +1095,7 @@ def render_research_tab():
         denoise = columns[1].toggle("Adaptive denoise", value=True, key="research_denoise")
         utmos = columns[2].toggle("UTMOS score", value=True, key="research_utmos", help="Downloads the SpeechMOS UTMOS22 model on first use.")
         release_models = columns[3].toggle("Free models after use", value=True, key="research_release",
-                                           help="Unloads large local models after each step so the next one fits in memory.")
+                                           help="Unloads local models after each ASR/TTS step to reduce peak memory. A selected loopback judge may be loaded again later.")
 
         heavy = [ASR_ENGINES[k]["label"] for k in asr if ASR_ENGINES[k]["heavy"]] + [TTS_ENGINES[k]["label"] for k in tts if TTS_ENGINES[k]["heavy"]]
         if heavy:
