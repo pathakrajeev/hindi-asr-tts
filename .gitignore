@@ -2,3 +2,11 @@
 .streamlit/secrets.toml
 .venv/
 __pycache__/
+.agents/
+.claude/
+*.pyc
+.DS_Store
+.vscode/
+*.egg-info/
+dist/
+build/
