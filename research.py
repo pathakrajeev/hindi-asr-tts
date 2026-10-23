@@ -46,6 +46,19 @@ MIN_PAUSE_S = 0.15
 PITCH_TRANSITION_ST = 0.25
 CONTOUR_POINTS = 200
 TTS_SEED = 20260906
+WHISPER_MODEL_ID = "openai/whisper-large-v3-turbo"
+WHISPER_REVISION = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
+INDIC_CONFORMER_MODEL_ID = "ai4bharat/indic-conformer-600m-multilingual"
+INDIC_CONFORMER_REVISION = "2a77d305038dfc502fd9464e7d028b90381976cb"
+SRAVAANI_MODEL_ID = "ARTPARK-IISc/SraVaani-1.0"
+SRAVAANI_MODEL_REVISION = "f5dd5358325a5208775b91dad98918e079ea2b27"
+MMS_MODEL_ID = "facebook/mms-tts-hin"
+MMS_REVISION = "1d83b223ec78e30b944f7d96bd117eb3d7023303"
+PARLER_MODEL_ID = "ai4bharat/indic-parler-tts"
+PARLER_REVISION = "660bc53c64ae83150613264111708a0465211237"
+PARLER_DESCRIPTION_MODEL_REVISIONS = {
+    "google/flan-t5-large": "0613663d0d48ea86ba8cb3d7a44f0f65dc596a2a",
+}
 PARLER_DESCRIPTION = (
     "Divya, a female speaker, speaks Hindi at a moderate pace with balanced pitch and slight "
     "expressiveness. The recording is very clear, close-sounding, and has almost no background noise."
@@ -88,11 +101,14 @@ def load_vad():
 def load_whisper():
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-    model_id = "openai/whisper-large-v3-turbo"
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id, dtype=torch.float32, low_cpu_mem_usage=True, use_safetensors=True
+        WHISPER_MODEL_ID,
+        revision=WHISPER_REVISION,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
     ).eval()
-    return model, AutoProcessor.from_pretrained(model_id)
+    return model, AutoProcessor.from_pretrained(WHISPER_MODEL_ID, revision=WHISPER_REVISION)
 
 
 @st.cache_resource(show_spinner=False)
@@ -100,7 +116,8 @@ def load_indic_conformer():
     from transformers import AutoModel
 
     return AutoModel.from_pretrained(
-        "ai4bharat/indic-conformer-600m-multilingual",
+        INDIC_CONFORMER_MODEL_ID,
+        revision=INDIC_CONFORMER_REVISION,
         trust_remote_code=True,
         token=secret("HF_TOKEN") or None,
     )
@@ -111,7 +128,10 @@ def load_sravaani():
     from transformers import AutoModel
 
     model = AutoModel.from_pretrained(
-        "ARTPARK-IISc/SraVaani-1.0", trust_remote_code=True, token=secret("HF_TOKEN") or None
+        SRAVAANI_MODEL_ID,
+        revision=SRAVAANI_MODEL_REVISION,
+        trust_remote_code=True,
+        token=secret("HF_TOKEN") or None,
     ).eval()
     for module in model.modules():
         if isinstance(module, torch.nn.RNNBase):
@@ -123,8 +143,11 @@ def load_sravaani():
 def load_mms():
     from transformers import VitsModel, VitsTokenizer
 
-    model_id = "facebook/mms-tts-hin"
-    return VitsModel.from_pretrained(model_id, dtype=torch.float32).eval(), VitsTokenizer.from_pretrained(model_id)
+    model = VitsModel.from_pretrained(
+        MMS_MODEL_ID, revision=MMS_REVISION, dtype=torch.float32
+    ).eval()
+    tokenizer = VitsTokenizer.from_pretrained(MMS_MODEL_ID, revision=MMS_REVISION)
+    return model, tokenizer
 
 
 @st.cache_resource(show_spinner=False)
@@ -139,10 +162,23 @@ def load_parler():
         ) from exc
     from transformers import AutoTokenizer
 
-    model_id, token = "ai4bharat/indic-parler-tts", secret("HF_TOKEN") or None
-    model = ParlerTTSForConditionalGeneration.from_pretrained(model_id, token=token).eval()
-    prompt_tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
-    description_tokenizer = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path, token=token)
+    token = secret("HF_TOKEN") or None
+    model = ParlerTTSForConditionalGeneration.from_pretrained(
+        PARLER_MODEL_ID, revision=PARLER_REVISION, token=token
+    ).eval()
+    prompt_tokenizer = AutoTokenizer.from_pretrained(
+        PARLER_MODEL_ID, revision=PARLER_REVISION, token=token
+    )
+    description_model_id = model.config.text_encoder._name_or_path
+    description_revision = PARLER_DESCRIPTION_MODEL_REVISIONS.get(description_model_id)
+    if description_revision is None:
+        raise RuntimeError(
+            f"No pinned tokenizer revision is configured for Indic Parler-TTS text encoder "
+            f"{description_model_id!r}."
+        )
+    description_tokenizer = AutoTokenizer.from_pretrained(
+        description_model_id, revision=description_revision, token=token
+    )
     return model, prompt_tokenizer, description_tokenizer
 
 

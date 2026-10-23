@@ -132,6 +132,12 @@ See [SECURITY.md](SECURITY.md) for deployment guides (Streamlit Cloud, Docker, s
 - Close other applications to free RAM
 - The app uses float16 precision to minimize memory usage
 - Consider using a GPU or cloud deployment (Streamlit Cloud)
+- SraVaani is a large local model; avoid selecting it on hosts with limited memory. Its load errors are shown in Research mode's ASR comparison and run log.
+
+### SraVaani fails to load in Research mode
+- Install the pinned Transformers 4.x dependency from `requirements.txt` (`pip install -r requirements.txt`) and restart the app.
+- SraVaani uses custom Hugging Face model code pinned to a fixed repository revision. Confirm your Hugging Face token has access if the model download is denied.
+- The other Hugging Face ASR/TTS checkpoints are pinned to fixed revisions in `research.py`; update those revisions deliberately when upgrading a model.
 
 ### Slow processing
 - Recording directly is faster than uploading files
