@@ -163,11 +163,20 @@ def render_live_tab() -> None:
     source = recording or upload
     if source is None:
         st.info(f"🎤 Record or upload a Hindi utterance up to {MAX_AUDIO_SECONDS} seconds.")
+    else:
+        raw = source.getvalue()
+        st.audio(raw)
+    if not st.button(
+        "Transcribe and speak",
+        type="primary",
+        width="stretch",
+        key="live_process",
+    ):
+        return
+    if source is None:
+        st.error("Record or upload audio before starting transcription.")
         return
     raw = source.getvalue()
-    st.audio(raw)
-    if not st.button("Transcribe and speak", type="primary", width="stretch", key="live_process"):
-        return
     try:
         with st.status("Processing live audio…", expanded=True) as status:
             audio, sample_rate, input_seconds = decode_audio(
