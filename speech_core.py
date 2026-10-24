@@ -5,6 +5,7 @@ import re
 import tempfile
 import time
 import unicodedata
+from collections.abc import Callable
 from pathlib import Path
 
 import librosa
@@ -22,6 +23,7 @@ KOYAL_CHECKPOINT = "koyal-hi-120m-1.0.nemo"
 SAMPLE_RATE = 16_000
 BULBUL_MAX_CHARS = 2_500
 MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024
+LIVE_ASR_WINDOW_SECONDS = 28
 WER_PUNCTUATION = re.compile(
     "[" + re.escape("।॥!?,.;:\"'`()[]{}-–—_/\\|<>*&^%$#@+=~") + "]"
 )
@@ -113,11 +115,53 @@ def nemo_transcribe_segments(model, segments: list[np.ndarray], sample_rate: int
 
 def transcribe(audio: np.ndarray, sample_rate: int) -> tuple[str, float]:
     started = time.perf_counter()
-    text = nemo_transcribe_segments(load_koyal(), [audio], sample_rate)[0]
+    window_samples = LIVE_ASR_WINDOW_SECONDS * sample_rate
+    segments = (
+        [audio[start:start + window_samples] for start in range(0, len(audio), window_samples)]
+        if len(audio) > window_samples
+        else [audio]
+    )
+    text = " ".join(nemo_transcribe_segments(load_koyal(), segments, sample_rate)).strip()
     elapsed = time.perf_counter() - started
     if not text:
         raise RuntimeError("Koyal returned an empty transcript.")
     return text, elapsed
+
+
+def split_tts_text(text: str, max_chars: int = BULBUL_MAX_CHARS) -> list[str]:
+    text = " ".join(text.split())
+    if not text:
+        raise ValueError("There is no transcript text to synthesize.")
+    if max_chars < 1:
+        raise ValueError("The TTS chunk size must be positive.")
+
+    chunks, current = [], ""
+    sentences = re.split(r"(?<=[.!?।॥])\s+", text)
+    for sentence in sentences:
+        if len(sentence) <= max_chars:
+            parts = [sentence]
+        else:
+            parts, part = [], ""
+            for word in sentence.split():
+                if len(word) > max_chars:
+                    raise ValueError(
+                        f"A transcript word exceeds Bulbul's {max_chars}-character limit."
+                    )
+                if part and len(part) + 1 + len(word) > max_chars:
+                    parts.append(part)
+                    part = ""
+                part = f"{part} {word}".strip()
+            if part:
+                parts.append(part)
+
+        for part in parts:
+            if current and len(current) + 1 + len(part) > max_chars:
+                chunks.append(current)
+                current = ""
+            current = f"{current} {part}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def synthesize(text: str) -> tuple[bytes, float, float]:
@@ -163,6 +207,40 @@ def synthesize(text: str) -> tuple[bytes, float, float]:
     wav = io.BytesIO()
     sf.write(wav, output, output_rate, format="WAV", subtype="PCM_16")
     return wav.getvalue(), elapsed, len(output) / output_rate
+
+
+def synthesize_in_chunks(
+    text: str,
+    on_chunk: Callable[[int, int], None] | None = None,
+) -> tuple[bytes, float, float, int]:
+    chunks = split_tts_text(text)
+    wav = io.BytesIO()
+    writer = None
+    output_rate = None
+    elapsed, duration = 0.0, 0.0
+
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            if on_chunk is not None:
+                on_chunk(index, len(chunks))
+            wav_bytes, chunk_elapsed, chunk_duration = synthesize(chunk)
+            audio, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=False)
+            audio = audio.mean(axis=1) if np.ndim(audio) > 1 else audio
+            if output_rate is not None and output_rate != sample_rate:
+                raise RuntimeError("Bulbul returned inconsistent sample rates between text chunks.")
+            output_rate = int(sample_rate)
+            if writer is None:
+                writer = sf.SoundFile(
+                    wav, mode="w", samplerate=output_rate, channels=1, format="WAV", subtype="PCM_16"
+                )
+            writer.write(np.asarray(audio, dtype=np.float32))
+            elapsed += chunk_elapsed
+            duration += chunk_duration
+    finally:
+        if writer is not None:
+            writer.close()
+
+    return wav.getvalue(), elapsed, duration, len(chunks)
 
 
 def normalize_reference_text(text: str) -> str:

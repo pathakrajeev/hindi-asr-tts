@@ -21,9 +21,15 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 st.set_page_config(page_title="Hindi ASR → TTS Pipeline", page_icon="🗣️", layout="centered")
 
 from research import render_research_tab  # noqa: E402
-from speech_core import decode_audio, dependency_message, synthesize, transcribe  # noqa: E402
+from speech_core import (
+    LIVE_ASR_WINDOW_SECONDS,
+    decode_audio,
+    dependency_message,
+    synthesize_in_chunks,
+    transcribe,
+)  # noqa: E402
 
-MAX_AUDIO_SECONDS = 30
+MAX_AUDIO_SECONDS = 25 * 60
 
 
 def audio_summary(audio: np.ndarray, sample_rate: int, text: str) -> dict[str, float | int]:
@@ -162,7 +168,7 @@ def render_live_tab() -> None:
         upload = st.file_uploader("Or upload audio", type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"], key="live_upload")
     source = recording or upload
     if source is None:
-        st.info(f"🎤 Record or upload a Hindi utterance up to {MAX_AUDIO_SECONDS} seconds.")
+        st.info("🎤 Record or upload Hindi audio up to 25 minutes (maximum file size: 50 MB).")
     else:
         raw = source.getvalue()
         size_mb = len(raw) / (1024 * 1024)
@@ -187,13 +193,27 @@ def render_live_tab() -> None:
             audio, sample_rate, input_seconds = decode_audio(
                 raw, Path(getattr(source, "name", "recording.wav")).suffix, MAX_AUDIO_SECONDS
             )
-            st.write("Transcribing with Koyal…")
+            if input_seconds > LIVE_ASR_WINDOW_SECONDS:
+                segment_count = int(np.ceil(input_seconds / LIVE_ASR_WINDOW_SECONDS))
+                st.write(
+                    f"Transcribing {input_seconds / 60:.1f} minutes with Koyal "
+                    f"in {segment_count} segments…"
+                )
+            else:
+                st.write("Transcribing with Koyal…")
             transcript, asr_seconds = transcribe(audio, sample_rate)
             st.write("Generating speech with Bulbul…")
-            generated_wav, tts_seconds, generated_seconds = synthesize(transcript)
+            generated_wav, tts_seconds, generated_seconds, tts_chunks = synthesize_in_chunks(
+                transcript,
+                on_chunk=lambda index, total: status.write(
+                    f"Generating speech chunk {index} of {total}…"
+                ),
+            )
             status.update(label="Complete", state="complete", expanded=False)
         st.subheader("📝 Transcript")
         st.write(transcript)
+        if tts_chunks > 1:
+            st.caption(f"Speech was generated in {tts_chunks} chunks to fit the TTS service limit.")
         st.subheader("🔊 Generated speech")
         st.audio(generated_wav, format="audio/wav")
         st.divider()
@@ -217,7 +237,7 @@ def render_mode_overview(mode: str) -> None:
         if mode == "Live":
             st.markdown("""
             **Live pipeline**
-            1. Record or upload a Hindi audio clip (up to 30 seconds).
+            1. Record or upload a Hindi audio clip (up to 25 minutes; maximum file size 50 MB).
             2. Transcribe it with Koyal Hindi ASR 120M.
             3. Generate speech from the transcript with Sarvam Bulbul v3.
             4. Review the transcript, generated audio, audio diagnostics, pitch and

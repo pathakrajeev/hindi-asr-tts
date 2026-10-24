@@ -70,9 +70,9 @@ Choose a workflow with the radio at the top of the app. Its Project overview
 summarizes the pipeline and metrics available in that mode.
 
 ### Live Mode
-1. Record Hindi speech or upload an audio file (WAV, MP3, M4A, etc.; up to 50 MB and 30 seconds)
+1. Record Hindi speech or upload an audio file (WAV, MP3, M4A, etc.; up to 50 MB and 25 minutes)
 2. Click **"Transcribe and speak"**
-3. View transcript and listen to generated speech
+3. View transcript and listen to generated speech; long transcripts are split into Bulbul-sized chunks
 4. Review audio diagnostics, pitch and energy contours, latency, and real-time factors
 
 ### Research Mode
