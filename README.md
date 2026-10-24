@@ -138,7 +138,7 @@ See [SECURITY.md](SECURITY.md) for deployment guides (Streamlit Cloud, Docker, s
 - Install the pinned Transformers 4.x dependency from `requirements.txt` (`pip install -r requirements.txt`) and restart the app.
 - SraVaani uses custom Hugging Face model code pinned to a fixed repository revision. Confirm your Hugging Face token has access if the model download is denied.
 - The other Hugging Face ASR/TTS checkpoints are pinned to fixed revisions in `research.py`; update those revisions deliberately when upgrading a model.
-- Research steps and SraVaani load/inference boundaries emit timestamped diagnostics to the server log, including process RSS when the host exposes it. On Streamlit Community Cloud, open the app's **Manage app → Logs** view. If the process is terminated for memory, the last emitted stage/RSS entry can help distinguish a model-load failure from an inference failure.
+- Research steps and SraVaani load/inference boundaries emit timestamped diagnostics to the server log, including process RSS and container memory when the host exposes them. On Linux, releasing a cached model also requests that free CPU heap pages be returned to the operating system. On Streamlit Community Cloud, open the app's **Manage app → Logs** view. If the process is terminated for memory, the last emitted stage and memory readings can help distinguish model-load failure from inference failure.
 
 ### Slow processing
 - Recording directly is faster than uploading files

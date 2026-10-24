@@ -1,8 +1,10 @@
+import ctypes
 import gc
 import html
 import io
 import logging
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -142,15 +144,47 @@ def _process_rss_mb() -> str:
     return "unavailable"
 
 
+def _container_memory_mb() -> str:
+    memory_files = (
+        (Path("/sys/fs/cgroup/memory.current"), Path("/sys/fs/cgroup/memory.max")),
+        (Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")),
+    )
+    for usage_path, limit_path in memory_files:
+        try:
+            usage = int(usage_path.read_text().strip())
+            limit_text = limit_path.read_text().strip()
+            if limit_text == "max":
+                return f"{usage / 1024**2:.0f} MB / unlimited"
+            limit = int(limit_text)
+            if limit > 0 and limit < 1 << 60:
+                return f"{usage / 1024**2:.0f} MB / {limit / 1024**2:.0f} MB"
+        except (OSError, ValueError):
+            continue
+    return "unavailable"
+
+
+def _trim_process_heap() -> str:
+    if not sys.platform.startswith("linux"):
+        return "unsupported"
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return "unavailable"
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return "trimmed free heap pages" if trim(0) else "no free heap pages"
+
+
 @st.cache_resource(show_spinner=False)
 def load_sravaani():
     from transformers import AutoModel
 
     logger.info(
-        "SraVaani model load started model=%s revision=%s rss=%s",
+        "SraVaani model load started model=%s revision=%s rss=%s container_memory=%s",
         SRAVAANI_MODEL_ID,
         SRAVAANI_MODEL_REVISION,
         _process_rss_mb(),
+        _container_memory_mb(),
     )
     try:
         model = AutoModel.from_pretrained(
@@ -165,7 +199,11 @@ def load_sravaani():
     for module in model.modules():
         if isinstance(module, torch.nn.RNNBase):
             module.flatten_parameters()
-    logger.info("SraVaani model load completed rss=%s", _process_rss_mb())
+    logger.info(
+        "SraVaani model load completed rss=%s container_memory=%s",
+        _process_rss_mb(),
+        _container_memory_mb(),
+    )
     return model
 
 
@@ -231,7 +269,16 @@ def release(key: str) -> None:
     loader = RELEASERS.get(key)
     if loader is not None:
         loader.clear()
-        gc.collect()
+        collected = gc.collect()
+        heap = _trim_process_heap()
+        logger.info(
+            "Released model cache key=%s gc_objects=%d heap_trim=%s rss=%s container_memory=%s",
+            key,
+            collected,
+            heap,
+            _process_rss_mb(),
+            _container_memory_mb(),
+        )
 
 
 # ---------------------------------------------------------------- preprocessing
@@ -430,9 +477,10 @@ def asr_sravaani(y, sr, windows, options):
     try:
         segments = _segments(y, windows)
         logger.info(
-            "SraVaani inference started segments=%d rss=%s",
+            "SraVaani inference started segments=%d rss=%s container_memory=%s",
             len(segments),
             _process_rss_mb(),
+            _container_memory_mb(),
         )
         for segment in segments:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file:
@@ -443,7 +491,11 @@ def asr_sravaani(y, sr, windows, options):
         if isinstance(hypotheses, tuple):
             hypotheses = hypotheses[0]
         transcript = " ".join(_text_from(h) for h in hypotheses)
-        logger.info("SraVaani inference completed rss=%s", _process_rss_mb())
+        logger.info(
+            "SraVaani inference completed rss=%s container_memory=%s",
+            _process_rss_mb(),
+            _container_memory_mb(),
+        )
         return transcript
     except Exception:
         logger.exception("SraVaani inference failed")
@@ -720,16 +772,22 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
     def step(name, fn, *args):
         status.write(f"{name}…")
         started = time.perf_counter()
-        logger.info("Research step started name=%s rss=%s", name, _process_rss_mb())
+        logger.info(
+            "Research step started name=%s rss=%s container_memory=%s",
+            name,
+            _process_rss_mb(),
+            _container_memory_mb(),
+        )
         try:
             value = fn(*args)
             elapsed = time.perf_counter() - started
             log.append({"Step": name, "Status": "ok", "Seconds": elapsed, "Detail": ""})
             logger.info(
-                "Research step completed name=%s seconds=%.2f rss=%s",
+                "Research step completed name=%s seconds=%.2f rss=%s container_memory=%s",
                 name,
                 elapsed,
                 _process_rss_mb(),
+                _container_memory_mb(),
             )
             return value, None
         except Exception as exc:
@@ -737,10 +795,11 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
             elapsed = time.perf_counter() - started
             log.append({"Step": name, "Status": "failed", "Seconds": elapsed, "Detail": message})
             logger.exception(
-                "Research step failed name=%s seconds=%.2f rss=%s",
+                "Research step failed name=%s seconds=%.2f rss=%s container_memory=%s",
                 name,
                 elapsed,
                 _process_rss_mb(),
+                _container_memory_mb(),
             )
             return None, message
 
