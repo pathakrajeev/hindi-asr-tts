@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-st.set_page_config(page_title="Hindi Live ASR → TTS", page_icon="🗣️", layout="centered")
+st.set_page_config(page_title="Hindi ASR → TTS Pipeline", page_icon="🗣️", layout="centered")
 
 from research import render_research_tab  # noqa: E402
 from speech_core import decode_audio, dependency_message, synthesize, transcribe  # noqa: E402
@@ -191,49 +191,57 @@ def render_live_tab() -> None:
         st.error(f"Processing failed: {type(exc).__name__}: {exc}")
 
 
-def render_overview_tab() -> None:
-    st.markdown("""
-    ## Developing ASR & TTS Systems in Hindi
+def render_mode_overview(mode: str) -> None:
+    with st.expander(f"Project overview · {mode}", expanded=False):
+        st.markdown("""
+        ## Hindi speech recognition and synthesis
 
-    ### The Challenge
-    Hindi is the **world's 3rd most spoken language** with 600M+ speakers, yet remains critically underserved by modern speech AI. Three challenges compound this:
+        Hindi ASR and TTS need to handle phonetic distinctions, regional pronunciation,
+        background noise, and Hindi-English code-mixing. This app provides a fast
+        single-model workflow and a configurable evaluation workflow.
+        """)
+        if mode == "Live":
+            st.markdown("""
+            **Live pipeline**
+            1. Record or upload a Hindi audio clip (up to 30 seconds).
+            2. Transcribe it with Koyal Hindi ASR 120M.
+            3. Generate speech from the transcript with Sarvam Bulbul v3.
+            4. Review the transcript, generated audio, audio diagnostics, pitch and
+               energy contours, processing latency, and real-time factors.
 
-    - **Phonetic Complexity**: Hindi has 45 phonemes (vs 24 in English). Retroflex ट vs dental त are phonemically distinct—changing meaning entirely. Example: ताल (rhythm) vs टाल (postpone).
-    - **Data Scarcity**: Whisper trained on 680K hours English but only 12K hours Hindi—fundamentally under-prepared.
-    - **Real-world Noise**: In railway stations and markets, WER exceeds 50%, making systems unusable.
+            Live mode does not require a reference transcript, so it does not report
+            reference-based WER or CER.
+            """)
+        else:
+            st.markdown("""
+            **Research pipeline**
+            1. Provide a golden-reference transcript and record or upload audio
+               (up to 120 seconds).
+            2. Select ASR and TTS models to compare on the same recording.
+            3. Review preprocessing and VAD diagnostics, WER/CER and word-level
+               alignment, model latency and real-time factor, TTS loopback and
+               optional UTMOS scores, plus prosody and voice measurements.
 
-    ### Additional Challenges
-    - **Code-mixing (Hinglish)**: "Main office ja raha hoon, meeting hai at 3 pm"—monolingual models fail.
-    - **Dialect Variation**: Bhojpuri, Rajasthani, Haryanvi introduce phonological variation.
-    - **Synthesis Rules**: Schwa deletion (राम → /raam/, not /rama/) and question intonation require purpose-built design.
-
-    ### Our Solution
-    - 🎯 **ASR comparison**: Koyal 120M, Sarvam Saaras v3, Whisper Large-v3-Turbo, IndicConformer 600M (CTC/RNNT), SraVaani-1.0
-    - 🔊 **TTS comparison**: Sarvam Bulbul v3, Meta MMS-TTS, Indic Parler-TTS
-    - 📊 **Research analysis**: VAD and adaptive denoising, WER/CER with word alignment, loopback intelligibility, UTMOS, prosody and voice quality
-    """)
-    st.divider()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Phonemes", "45", "vs 24 English (retroflex sounds)")
-    col2.metric("Training Data", "12K hrs", "vs 680K for English")
-    col3.metric("Real-world WER", ">50%", "Noisy environments")
+            Local models load only when selected. Model availability and memory
+            requirements vary by deployment.
+            """)
 
 
-st.title("🗣️ Hindi Live ASR → TTS")
-st.caption("Koyal Hindi ASR 120M → Sarvam Bulbul v3. Uploaded audio and reference text are not retained.")
-
-live_tab, research_tab, overview_tab = st.tabs(["Live Processing", "Research Mode", "📚 Project Overview"])
-
-with overview_tab:
-    render_overview_tab()
+st.title("🗣️ Hindi ASR → TTS Pipeline")
+mode = st.radio(
+    "Choose a workflow",
+    ["Live", "Research"],
+    horizontal=True,
+    key="app_mode",
+)
+render_mode_overview(mode)
 
 problem = dependency_message()
 if problem:
     st.error(problem)
     st.stop()
 
-with live_tab:
+if mode == "Live":
     render_live_tab()
-
-with research_tab:
+else:
     render_research_tab()
