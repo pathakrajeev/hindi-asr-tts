@@ -1,5 +1,6 @@
 import ctypes
 import gc
+import hashlib
 import html
 import io
 import logging
@@ -923,7 +924,13 @@ def _bar(frame: pd.DataFrame, field: str, title: str, colors: dict, color_field:
     order = [k for k in colors if k in set(frame[color_field])]
     bars = alt.Chart(frame, title=title).mark_bar(cornerRadiusEnd=4, height={"band": 0.6}).encode(
         x=alt.X(f"{field}:Q", title=None),
-        y=alt.Y(f"{color_field}:N", sort=order, title=None),
+        y=alt.Y(
+            f"{color_field}:N",
+            sort=order,
+            title=None,
+            axis=alt.Axis(labelLimit=240, labelFontSize=12),
+            scale=alt.Scale(paddingInner=0.4),
+        ),
         color=alt.Color(f"{color_field}:N", scale=alt.Scale(domain=list(colors), range=list(colors.values())), legend=None),
         tooltip=[alt.Tooltip(f"{color_field}:N", title="Model"), alt.Tooltip(f"{field}:Q", title=title, format=fmt)],
     )
@@ -931,7 +938,7 @@ def _bar(frame: pd.DataFrame, field: str, title: str, colors: dict, color_field:
     chart = bars + labels
     if rule is not None:
         chart += alt.Chart(pd.DataFrame({"x": [rule]})).mark_rule(strokeDash=[4, 4], color="#8a8985").encode(x="x:Q")
-    return chart.properties(height=max(90, 34 * len(frame)))
+    return chart.properties(height=max(150, 56 * len(frame)))
 
 
 def _show(chart):
@@ -1026,11 +1033,8 @@ def render_asr(result):
 
     frame = pd.DataFrame([{"Model": r["label"], "WER": r["wer"], "CER": r["cer"], "Latency": r["latency"], "RTF": r["rtf"]} for r in ok])
     colors = {ASR_ENGINES[k]["label"]: c for k, c in ASR_COLORS.items()}
-    left, right = st.columns(2)
-    with left:
-        _show(_bar(frame, "WER", "Word error rate (%) — lower is better", colors, "Model"))
-    with right:
-        _show(_bar(frame, "CER", "Character error rate (%) — lower is better", colors, "Model"))
+    _show(_bar(frame, "WER", "Word error rate (%) — lower is better", colors, "Model"))
+    _show(_bar(frame, "CER", "Character error rate (%) — lower is better", colors, "Model"))
 
     errors = pd.DataFrame([
         {"Model": r["label"], "Error type": kind, "Count": r[field]}
@@ -1039,18 +1043,21 @@ def render_asr(result):
     kinds = ["Substitution", "Deletion", "Insertion"]
     stacked = alt.Chart(errors, title="Word errors by type").mark_bar(stroke="white", strokeWidth=2, height={"band": 0.6}).encode(
         x=alt.X("Count:Q", stack="zero", title="Word errors"),
-        y=alt.Y("Model:N", sort=[l for l in colors if l in set(errors["Model"])], title=None),
+        y=alt.Y(
+            "Model:N",
+            sort=[l for l in colors if l in set(errors["Model"])],
+            title=None,
+            axis=alt.Axis(labelLimit=240, labelFontSize=12),
+            scale=alt.Scale(paddingInner=0.4),
+        ),
         color=alt.Color("Error type:N", scale=alt.Scale(domain=kinds, range=PALETTE[:3]), legend=alt.Legend(orient="top", title=None)),
         order=alt.Order("order:Q"),
         tooltip=["Model", "Error type", "Count"],
     ).transform_calculate(order="indexof(['Substitution','Deletion','Insertion'], datum['Error type'])")
-    _show(stacked.properties(height=max(90, 34 * len(ok))))
+    _show(stacked.properties(height=max(150, 56 * len(ok))))
 
-    left, right = st.columns(2)
-    with left:
-        _show(_bar(frame, "Latency", "Processing time (s)", colors, "Model"))
-    with right:
-        _show(_bar(frame, "RTF", "Real-time factor — below 1 is faster than real time", colors, "Model", fmt=".3f", rule=1.0))
+    _show(_bar(frame, "Latency", "Processing time (s)", colors, "Model"))
+    _show(_bar(frame, "RTF", "Real-time factor — below 1 is faster than real time", colors, "Model", fmt=".3f", rule=1.0))
 
     st.markdown("#### Word-level alignment against the reference")
     st.caption("Highlighted = substitution (reference in brackets) · strike-through = deleted reference word · underline = inserted word.")
@@ -1189,6 +1196,11 @@ def _format_engine(engines):
     return lambda key: f"{engines[key]['label']} ({engines[key]['memory']})"
 
 
+def _clear_research_result() -> None:
+    st.session_state.pop("research_result", None)
+    st.session_state.pop("research_result_source_digest", None)
+
+
 def render_research_tab():
     st.subheader("Research mode")
     st.caption(
@@ -1211,10 +1223,25 @@ def render_research_tab():
 
     left, right = st.columns(2)
     with left:
-        recording = st.audio_input("Record Hindi speech", key="research_recording")
+        recording = st.audio_input(
+            "Record Hindi speech",
+            key="research_recording",
+            on_change=_clear_research_result,
+        )
     with right:
-        upload = st.file_uploader("Or upload audio", type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"], key="research_upload")
+        upload = st.file_uploader(
+            "Or upload audio",
+            type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"],
+            key="research_upload",
+            on_change=_clear_research_result,
+        )
     source = recording or upload
+    source_bytes = source.getvalue() if source is not None else None
+    source_digest = hashlib.sha256(source_bytes).hexdigest() if source_bytes is not None else None
+    previous_digest = st.session_state.get("research_result_source_digest")
+    if source_digest != previous_digest:
+        st.session_state.pop("research_result", None)
+        st.session_state.pop("research_result_source_digest", None)
 
     with st.container(border=True):
         st.markdown("**Models**")
@@ -1256,13 +1283,16 @@ def render_research_tab():
 
     can_run = source is not None and reference_ok and bool(asr)
     if st.button("Run research comparison", type="primary", width="stretch", disabled=not can_run, key="research_run"):
+        st.session_state.pop("research_result", None)
+        st.session_state.pop("research_result_source_digest", None)
         try:
-            audio, sr, _ = decode_audio(source.getvalue(), Path(getattr(source, "name", "recording.wav")).suffix, MAX_RESEARCH_SECONDS)
+            audio, sr, _ = decode_audio(source_bytes, Path(getattr(source, "name", "recording.wav")).suffix, MAX_RESEARCH_SECONDS)
             options = {"asr": asr, "tts": tts, "tts_source": tts_source, "judge": judge, "sarvam_mode": sarvam_mode,
                        "denoise": denoise, "utmos": utmos, "release": release_models}
             with st.status("Running research comparison…", expanded=True) as status:
                 st.session_state["research_result"] = run_research(audio, sr, reference_text, options, status)
                 st.session_state["research_result"]["name"] = getattr(source, "name", "recording")
+                st.session_state["research_result_source_digest"] = source_digest
                 status.update(label="Research comparison complete", state="complete", expanded=False)
         except Exception as exc:
             st.error(f"Research run failed: {type(exc).__name__}: {exc}")
