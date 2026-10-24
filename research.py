@@ -1192,7 +1192,7 @@ def _format_engine(engines):
 def render_research_tab():
     st.subheader("Research mode")
     st.caption(
-        "Compare every ASR and TTS model from the research notebook on one recording, scored against a "
+        "Compare selected ASR and TTS models on one recording, scored against a "
         "golden-reference transcript. Local models load only when selected."
     )
 

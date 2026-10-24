@@ -3,13 +3,16 @@
 A Streamlit app for real-time Hindi speech recognition and synthesis.
 
 **Features:**
-- 🎤 **Live Mode**: Record or upload Hindi audio → Transcribe → Synthesize speech
-- 🔬 **Research Mode**: Compare ASR output against ground truth (WER/CER metrics)
-- 📊 **Analysis**: Audio metrics, spectrograms, real-time factors
+- 🎤 **Live Mode**: Record or upload Hindi audio → transcribe → synthesize speech
+- 🔬 **Research Mode**: Compare selected models against a reference transcript (WER/CER metrics)
+- 📊 **Analysis**: Audio diagnostics, spectrograms, model comparisons, and real-time factors
 
 **Models:**
 - ASR: [Koyal Hindi 120M](https://huggingface.co/adalat-ai/koyal-hi-120m-1.0)
 - TTS: [Sarvam Bulbul v3](https://console.sarvam.ai/)
+
+Choose Live or Research with the workflow radio at the top of the app. The Project
+overview below it updates to describe the selected workflow.
 
 ---
 
@@ -63,17 +66,21 @@ Visit http://localhost:8501
 
 ## 📋 Usage
 
+Choose a workflow with the radio at the top of the app. Its Project overview
+summarizes the pipeline and metrics available in that mode.
+
 ### Live Mode
 1. Record Hindi speech or upload an audio file (WAV, MP3, M4A, etc.)
 2. Click **"Transcribe and speak"**
 3. View transcript and listen to generated speech
-4. See performance metrics (latency, real-time factor)
+4. Review audio diagnostics, pitch and energy contours, latency, and real-time factors
 
 ### Research Mode
-1. Upload a `.txt` file with the ground-truth transcript
-2. Record/upload audio
-3. Click **"Transcribe and speak"**
-4. View WER/CER metrics + detailed audio analysis
+1. Upload a `.txt` file with the ground-truth transcript or paste it into the text area
+2. Record or upload audio and select the ASR/TTS models to compare
+3. Click **"Run research comparison"**
+4. Review preprocessing and VAD diagnostics, WER/CER and word alignment, model latency,
+   TTS loopback and optional UTMOS scores, plus prosody and voice measurements
 
 ---
 
