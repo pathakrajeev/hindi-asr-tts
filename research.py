@@ -1,6 +1,7 @@
 import gc
 import html
 import io
+import logging
 import re
 import tempfile
 import time
@@ -30,6 +31,14 @@ from speech_core import (
     secret,
     synthesize,
 )
+
+logger = logging.getLogger("hindi_asr_tts")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.propagate = False
 
 MAX_RESEARCH_SECONDS = 120
 MAX_WINDOW_SECONDS = 28.0
@@ -123,19 +132,40 @@ def load_indic_conformer():
     )
 
 
+def _process_rss_mb() -> str:
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return f"{int(line.split()[1]) / 1024:.0f} MB"
+    except OSError:
+        pass
+    return "unavailable"
+
+
 @st.cache_resource(show_spinner=False)
 def load_sravaani():
     from transformers import AutoModel
 
-    model = AutoModel.from_pretrained(
+    logger.info(
+        "SraVaani model load started model=%s revision=%s rss=%s",
         SRAVAANI_MODEL_ID,
-        revision=SRAVAANI_MODEL_REVISION,
-        trust_remote_code=True,
-        token=secret("HF_TOKEN") or None,
-    ).eval()
+        SRAVAANI_MODEL_REVISION,
+        _process_rss_mb(),
+    )
+    try:
+        model = AutoModel.from_pretrained(
+            SRAVAANI_MODEL_ID,
+            revision=SRAVAANI_MODEL_REVISION,
+            trust_remote_code=True,
+            token=secret("HF_TOKEN") or None,
+        ).eval()
+    except Exception:
+        logger.exception("SraVaani model load failed")
+        raise
     for module in model.modules():
         if isinstance(module, torch.nn.RNNBase):
             module.flatten_parameters()
+    logger.info("SraVaani model load completed rss=%s", _process_rss_mb())
     return model
 
 
@@ -398,7 +428,13 @@ def asr_sravaani(y, sr, windows, options):
     model = load_sravaani()
     paths = []
     try:
-        for segment in _segments(y, windows):
+        segments = _segments(y, windows)
+        logger.info(
+            "SraVaani inference started segments=%d rss=%s",
+            len(segments),
+            _process_rss_mb(),
+        )
+        for segment in segments:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file:
                 paths.append(file.name)
             sf.write(paths[-1], segment, sr, subtype="PCM_16")
@@ -406,7 +442,12 @@ def asr_sravaani(y, sr, windows, options):
             hypotheses = model.transcribe(paths, return_hypotheses=True)
         if isinstance(hypotheses, tuple):
             hypotheses = hypotheses[0]
-        return " ".join(_text_from(h) for h in hypotheses)
+        transcript = " ".join(_text_from(h) for h in hypotheses)
+        logger.info("SraVaani inference completed rss=%s", _process_rss_mb())
+        return transcript
+    except Exception:
+        logger.exception("SraVaani inference failed")
+        raise
     finally:
         for path in paths:
             Path(path).unlink(missing_ok=True)
@@ -679,13 +720,28 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
     def step(name, fn, *args):
         status.write(f"{name}…")
         started = time.perf_counter()
+        logger.info("Research step started name=%s rss=%s", name, _process_rss_mb())
         try:
             value = fn(*args)
-            log.append({"Step": name, "Status": "ok", "Seconds": time.perf_counter() - started, "Detail": ""})
+            elapsed = time.perf_counter() - started
+            log.append({"Step": name, "Status": "ok", "Seconds": elapsed, "Detail": ""})
+            logger.info(
+                "Research step completed name=%s seconds=%.2f rss=%s",
+                name,
+                elapsed,
+                _process_rss_mb(),
+            )
             return value, None
         except Exception as exc:
             message = f"{type(exc).__name__}: {str(exc)[:400]}"
-            log.append({"Step": name, "Status": "failed", "Seconds": time.perf_counter() - started, "Detail": message})
+            elapsed = time.perf_counter() - started
+            log.append({"Step": name, "Status": "failed", "Seconds": elapsed, "Detail": message})
+            logger.exception(
+                "Research step failed name=%s seconds=%.2f rss=%s",
+                name,
+                elapsed,
+                _process_rss_mb(),
+            )
             return None, message
 
     pre, error = step("Preprocessing (normalize, VAD, denoise)", preprocess, audio, sr, options["denoise"])
