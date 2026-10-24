@@ -45,6 +45,7 @@ logger.propagate = False
 MAX_RESEARCH_SECONDS = 120
 MAX_WINDOW_SECONDS = 28.0
 TTS_COMPARISON_MAX_CHARS = 650
+SRAVAANI_MIN_INFERENCE_HEADROOM_MB = 1024
 TARGET_RMS_DBFS = -20.0
 PEAK_CEILING_DBFS = -1.0
 DENOISE_SNR_THRESHOLD_DB = 20.0
@@ -161,6 +162,25 @@ def _container_memory_mb() -> str:
         except (OSError, ValueError):
             continue
     return "unavailable"
+
+
+def _container_memory_available_mb() -> int | None:
+    memory_files = (
+        (Path("/sys/fs/cgroup/memory.current"), Path("/sys/fs/cgroup/memory.max")),
+        (Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")),
+    )
+    for usage_path, limit_path in memory_files:
+        try:
+            usage = int(usage_path.read_text().strip())
+            limit_text = limit_path.read_text().strip()
+            if limit_text == "max":
+                return None
+            limit = int(limit_text)
+            if 0 < limit < 1 << 60:
+                return max(0, (limit - usage) // 1024**2)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _trim_process_heap() -> str:
@@ -473,6 +493,15 @@ def _asr_indic_conformer(decoder):
 
 def asr_sravaani(y, sr, windows, options):
     model = load_sravaani()
+    available_mb = _container_memory_available_mb()
+    if available_mb is not None and available_mb < SRAVAANI_MIN_INFERENCE_HEADROOM_MB:
+        message = (
+            f"SraVaani loaded, but inference was not started: only {available_mb} MB of container "
+            f"memory remained; at least {SRAVAANI_MIN_INFERENCE_HEADROOM_MB} MB is required. "
+            "Use a larger-memory deployment or deselect SraVaani."
+        )
+        logger.error("%s rss=%s container_memory=%s", message, _process_rss_mb(), _container_memory_mb())
+        raise RuntimeError(message)
     paths = []
     try:
         segments = _segments(y, windows)
