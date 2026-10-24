@@ -70,14 +70,14 @@ Choose a workflow with the radio at the top of the app. Its Project overview
 summarizes the pipeline and metrics available in that mode.
 
 ### Live Mode
-1. Record Hindi speech or upload an audio file (WAV, MP3, M4A, etc.)
+1. Record Hindi speech or upload an audio file (WAV, MP3, M4A, etc.; up to 50 MB and 30 seconds)
 2. Click **"Transcribe and speak"**
 3. View transcript and listen to generated speech
 4. Review audio diagnostics, pitch and energy contours, latency, and real-time factors
 
 ### Research Mode
 1. Upload a `.txt` file with the ground-truth transcript or paste it into the text area
-2. Record or upload audio and select the ASR/TTS models to compare
+2. Record or upload audio (up to 50 MB and 120 seconds) and select the ASR/TTS models to compare
 3. Click **"Run research comparison"**
 4. Review preprocessing and VAD diagnostics, WER/CER and word alignment, model latency,
    TTS loopback and optional UTMOS scores, plus prosody and voice measurements

@@ -21,6 +21,7 @@ KOYAL_REVISION = "7f2cb579598ba607b7ebb78a1b523fbcb83f4cf9"
 KOYAL_CHECKPOINT = "koyal-hi-120m-1.0.nemo"
 SAMPLE_RATE = 16_000
 BULBUL_MAX_CHARS = 2_500
+MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024
 WER_PUNCTUATION = re.compile(
     "[" + re.escape("।॥!?,.;:\"'`()[]{}-–—_/\\|<>*&^%$#@+=~") + "]"
 )
@@ -54,15 +55,24 @@ def load_koyal():
 def decode_audio(raw: bytes, suffix: str, max_seconds: float) -> tuple[np.ndarray, int, float]:
     if not raw:
         raise ValueError("Audio file is empty.")
-    if len(raw) > 100 * 1024 * 1024:
-        raise ValueError("Audio file is too large (max 100 MB).")
+    if len(raw) > MAX_AUDIO_FILE_BYTES:
+        raise ValueError("Audio file is too large (max 50 MB).")
     with tempfile.NamedTemporaryFile(suffix=suffix or ".wav", delete=False) as file:
         file.write(raw)
         path = file.name
     try:
-        audio, sample_rate = librosa.load(path, sr=SAMPLE_RATE, mono=True)
-    except Exception as exc:
-        raise ValueError("Failed to decode audio. Ensure it's a valid audio file.") from exc
+        try:
+            duration = librosa.get_duration(path=path)
+        except Exception as exc:
+            raise ValueError("Failed to inspect audio. Ensure it's a valid audio file.") from exc
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError("Audio file has no readable duration.")
+        if duration > max_seconds:
+            raise ValueError(f"Audio must be ≤{max_seconds:.0f}s; received {duration:.1f}s.")
+        try:
+            audio, sample_rate = librosa.load(path, sr=SAMPLE_RATE, mono=True)
+        except Exception as exc:
+            raise ValueError("Failed to decode audio. Ensure it's a valid audio file.") from exc
     finally:
         Path(path).unlink(missing_ok=True)
     audio = np.asarray(audio, dtype=np.float32)
