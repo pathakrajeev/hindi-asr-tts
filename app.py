@@ -38,7 +38,7 @@ def render_figure(fig, alt: str) -> None:
     try:
         image = io.BytesIO()
         fig.savefig(image, format="png", bbox_inches="tight")
-        st.image(image.getvalue(), alt=alt)
+        st.image(image.getvalue(), caption=alt, width="stretch")
     finally:
         plt.close(fig)
 

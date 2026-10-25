@@ -950,7 +950,7 @@ def _fig_close(fig, alt_text):
     try:
         image = io.BytesIO()
         fig.savefig(image, format="png", bbox_inches="tight")
-        st.image(image.getvalue(), alt=alt_text)
+        st.image(image.getvalue(), caption=alt_text, width="stretch")
     finally:
         plt.close(fig)
 

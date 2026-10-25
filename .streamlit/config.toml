@@ -1,6 +1,7 @@
 [server]
 maxUploadSize = 50
 fileWatcherType = "none"
+enableXsrfProtection = false
 
 [theme]
 base = "light"
