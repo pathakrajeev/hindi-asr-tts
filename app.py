@@ -182,12 +182,9 @@ def render_live_tab() -> None:
         st.info("🎤 Record or upload Hindi audio up to 25 minutes (maximum file size: 50 MB).")
     else:
         raw = source.getvalue()
+        source_name = getattr(source, "name", "recording.wav")
         size_mb = len(raw) / (1024 * 1024)
-        st.caption(f"Selected: {getattr(source, 'name', 'recording')} · {size_mb:.1f} MB")
-        if size_mb <= 8:
-            st.audio(raw)
-        else:
-            st.caption("Audio preview is hidden for large uploads to reduce browser memory use.")
+        st.caption(f"Selected: {source_name} · {size_mb:.1f} MB")
     if not st.button(
         "Transcribe and speak",
         type="primary",
