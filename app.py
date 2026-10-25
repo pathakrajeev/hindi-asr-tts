@@ -27,6 +27,7 @@ from speech_core import (
     LIVE_ASR_WINDOW_SECONDS,
     decode_audio,
     dependency_message,
+    media_data_uri,
     synthesize_in_chunks,
     transcribe,
 )  # noqa: E402
@@ -39,7 +40,7 @@ def render_figure(fig, alt: str) -> None:
     try:
         image = io.BytesIO()
         fig.savefig(image, format="png", bbox_inches="tight")
-        st.image(image.getvalue(), caption=alt, width="stretch")
+        st.image(media_data_uri(image.getvalue(), "image/png"), caption=alt, width="stretch")
     finally:
         plt.close(fig)
 
@@ -224,7 +225,7 @@ def render_live_tab() -> None:
         if tts_chunks > 1:
             st.caption(f"Speech was generated in {tts_chunks} chunks to fit the TTS service limit.")
         st.subheader("🔊 Generated speech")
-        st.audio(generated_wav, format="audio/wav")
+        st.audio(media_data_uri(generated_wav, "audio/wav"), format="audio/wav")
         st.divider()
         try:
             render_metrics_dashboard(

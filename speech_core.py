@@ -52,6 +52,11 @@ def secret(name: str) -> str:
     return str(value or os.environ.get(name, "")).strip()
 
 
+def media_data_uri(data: bytes, mime_type: str) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def dependency_message() -> str | None:
     for name in ("HF_TOKEN", "SARVAM_API_KEY"):
         if not secret(name):

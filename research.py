@@ -28,6 +28,7 @@ from speech_core import (
     SAMPLE_RATE,
     decode_audio,
     load_koyal,
+    media_data_uri,
     nemo_transcribe_segments,
     normalize_reference_text,
     score_transcript,
@@ -950,7 +951,7 @@ def _fig_close(fig, alt_text):
     try:
         image = io.BytesIO()
         fig.savefig(image, format="png", bbox_inches="tight")
-        st.image(image.getvalue(), caption=alt_text, width="stretch")
+        st.image(media_data_uri(image.getvalue(), "image/png"), caption=alt_text, width="stretch")
     finally:
         plt.close(fig)
 
@@ -1077,12 +1078,12 @@ def render_tts(result):
                 f"{', trimmed at a sentence boundary to ' + str(TTS_COMPARISON_MAX_CHARS) + ' characters' if result['tts_truncated'] else ''}):")
     st.text(result["tts_text"])
     rows = result["tts"]
-    st.audio(_wav_bytes(result["audio"], result["sr"]), format="audio/wav")
+    st.audio(media_data_uri(_wav_bytes(result["audio"], result["sr"]), "audio/wav"), format="audio/wav")
     st.caption("Original input speech")
     for r in rows:
         if r["status"] == "ok":
             st.markdown(f"**{r['label']}**")
-            st.audio(r["wav"], format="audio/wav")
+            st.audio(media_data_uri(r["wav"], "audio/wav"), format="audio/wav")
         else:
             st.error(f"**{r['label']}** failed — {r['error']}")
     ok = [r for r in rows if r["status"] == "ok"]
