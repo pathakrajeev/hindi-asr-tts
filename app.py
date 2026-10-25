@@ -23,6 +23,7 @@ st.set_page_config(page_title="Hindi ASR → TTS Pipeline", page_icon="🗣️",
 
 from research import render_research_tab  # noqa: E402
 from speech_core import (
+    EmptyTranscriptError,
     LIVE_ASR_WINDOW_SECONDS,
     decode_audio,
     dependency_message,
@@ -233,6 +234,15 @@ def render_live_tab() -> None:
         except Exception:
             logger.exception("Live speech metrics rendering failed")
             st.warning("Speech generation succeeded, but its metrics and charts could not be displayed.")
+    except EmptyTranscriptError as exc:
+        logger.warning("Live ASR produced no transcript: %s", exc.diagnostics)
+        st.error("Koyal did not recognize any words in this recording.")
+        st.caption(exc.diagnostics)
+        st.info(
+            "Try a clear 5–10 second Hindi recording with speech close to the microphone, "
+            "or upload a WAV recording. If it still returns no words, compare with Sarvam Saaras "
+            "in Research mode to check whether the issue is specific to Koyal."
+        )
     except Exception as exc:
         logger.exception("Live speech processing failed")
         st.error(f"Processing failed: {type(exc).__name__}: {exc}")

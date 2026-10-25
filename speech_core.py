@@ -29,6 +29,21 @@ WER_PUNCTUATION = re.compile(
 )
 
 
+class EmptyTranscriptError(RuntimeError):
+    def __init__(self, audio: np.ndarray, sample_rate: int):
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) if len(audio) else 0.0
+        active_threshold = max(peak * 0.02, 1e-4)
+        active_percent = float(np.mean(np.abs(audio) > active_threshold) * 100) if len(audio) else 0.0
+        duration = len(audio) / sample_rate if sample_rate else 0.0
+        self.diagnostics = (
+            f"Decoded audio: {duration:.1f}s at {sample_rate} Hz; "
+            f"peak {peak:.3f}; RMS {20 * np.log10(max(rms, 1e-8)):.1f} dBFS; "
+            f"{active_percent:.1f}% of samples above 2% of peak."
+        )
+        super().__init__("Koyal returned an empty transcript.")
+
+
 def secret(name: str) -> str:
     try:
         value = st.secrets.get(name, "")
@@ -124,7 +139,7 @@ def transcribe(audio: np.ndarray, sample_rate: int) -> tuple[str, float]:
     text = " ".join(nemo_transcribe_segments(load_koyal(), segments, sample_rate)).strip()
     elapsed = time.perf_counter() - started
     if not text:
-        raise RuntimeError("Koyal returned an empty transcript.")
+        raise EmptyTranscriptError(audio, sample_rate)
     return text, elapsed
 
 
