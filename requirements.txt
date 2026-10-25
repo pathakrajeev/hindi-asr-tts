@@ -1,9 +1,11 @@
 streamlit>=1.46,<2
-torch>=2.5
-torchaudio>=2.5
+torch==2.6.0
+torchaudio==2.6.0
 nemo_toolkit[asr]>=3.0,<4
-transformers>=4.45,<5
+transformers==4.46.1
+parler-tts @ git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68
 huggingface_hub>=0.27
+onnx==1.16.2
 onnxruntime>=1.18
 silero-vad==6.2.3
 noisereduce>=3

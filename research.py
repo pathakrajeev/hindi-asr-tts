@@ -117,7 +117,7 @@ def load_whisper():
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         WHISPER_MODEL_ID,
         revision=WHISPER_REVISION,
-        dtype=torch.float32,
+        torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
         use_safetensors=True,
     ).eval()
@@ -233,7 +233,7 @@ def load_mms():
     from transformers import VitsModel, VitsTokenizer
 
     model = VitsModel.from_pretrained(
-        MMS_MODEL_ID, revision=MMS_REVISION, dtype=torch.float32
+        MMS_MODEL_ID, revision=MMS_REVISION, torch_dtype=torch.float32
     ).eval()
     tokenizer = VitsTokenizer.from_pretrained(MMS_MODEL_ID, revision=MMS_REVISION)
     return model, tokenizer
@@ -245,9 +245,9 @@ def load_parler():
         from parler_tts import ParlerTTSForConditionalGeneration
     except ImportError as exc:
         raise RuntimeError(
-            "Indic Parler-TTS needs the parler-tts package, which pins transformers 4.46 and a "
-            "torchaudio build that this environment (torch 2.14, transformers 5.x) cannot use. "
-            "Run it from a separate Python 3.11 environment."
+            "Could not import Indic Parler-TTS. Rebuild the Space from the project's requirements.txt "
+            "so its pinned parler-tts, torch, torchaudio, and transformers versions are installed. "
+            "A separate Python environment would not be available to this Streamlit process."
         ) from exc
     from transformers import AutoTokenizer
 
@@ -947,8 +947,12 @@ def _show(chart):
 
 
 def _fig_close(fig, alt_text):
-    st.pyplot(fig, alt=alt_text)
-    plt.close(fig)
+    try:
+        image = io.BytesIO()
+        fig.savefig(image, format="png", bbox_inches="tight")
+        st.image(image.getvalue(), alt=alt_text)
+    finally:
+        plt.close(fig)
 
 
 def _mel_db(y, sr, ref):
@@ -1271,9 +1275,9 @@ def render_research_tab():
         heavy = [ASR_ENGINES[k]["label"] for k in asr if ASR_ENGINES[k]["heavy"]] + [TTS_ENGINES[k]["label"] for k in tts if TTS_ENGINES[k]["heavy"]]
         if heavy:
             st.warning(
-                f"{', '.join(heavy)} run locally on CPU: expect several minutes per model and first-run downloads of several GB. "
-                "If loading fails with a memory error, enable a Windows page file or deselect models. "
-                "Streamlit Community Cloud (~2.7 GB RAM) cannot load these."
+                f"{', '.join(heavy)} run locally on the Space's CPU. Expect several minutes per model "
+                "and first-run downloads of several GB. Check the memory estimates shown beside each "
+                "model against your Space hardware; deselect models if you run out of memory."
             )
 
     if source is None:

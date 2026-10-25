@@ -30,6 +30,16 @@ from speech_core import (
 )  # noqa: E402
 
 MAX_AUDIO_SECONDS = 25 * 60
+logger = logging.getLogger("hindi_asr_tts")
+
+
+def render_figure(fig, alt: str) -> None:
+    try:
+        image = io.BytesIO()
+        fig.savefig(image, format="png", bbox_inches="tight")
+        st.image(image.getvalue(), alt=alt)
+    finally:
+        plt.close(fig)
 
 
 def audio_summary(audio: np.ndarray, sample_rate: int, text: str) -> dict[str, float | int]:
@@ -111,8 +121,7 @@ def render_metrics_dashboard(
             )
             spectrum_axis.set(title=f"{label} log-Mel spectrogram", xlabel="Time (s)", ylabel="Mel frequency")
             fig.colorbar(image, ax=spectrum_axis, format="%+2.0f dB")
-        st.pyplot(fig, alt="Input and generated speech waveforms and log-Mel spectrograms")
-        plt.close(fig)
+        render_figure(fig, "Input and generated speech waveforms and log-Mel spectrograms")
 
     with analysis_tabs[2]:
         fig, axes = plt.subplots(2, 1, figsize=(12, 7), constrained_layout=True)
@@ -135,8 +144,7 @@ def render_metrics_dashboard(
             axis.grid(True, alpha=0.25)
             axis.legend()
         st.caption("Pitch is estimated with YIN and masked during low-energy frames; it is descriptive, not a voice-quality score.")
-        st.pyplot(fig, alt="Estimated pitch and RMS energy contours for the input and generated speech")
-        plt.close(fig)
+        render_figure(fig, "Estimated pitch and RMS energy contours for the input and generated speech")
 
     with analysis_tabs[3]:
         asr_rtf = asr_seconds / input_seconds if input_seconds else 0.0
@@ -154,8 +162,10 @@ def render_metrics_dashboard(
         axes[1].legend()
         for axis in axes:
             axis.grid(axis="x", alpha=0.25)
-        st.pyplot(fig, alt="Horizontal bars compare ASR and TTS latency and real-time factor; lower values are faster")
-        plt.close(fig)
+        render_figure(
+            fig,
+            "Horizontal bars compare ASR and TTS latency and real-time factor; lower values are faster",
+        )
 
 
 def render_live_tab() -> None:
@@ -217,11 +227,16 @@ def render_live_tab() -> None:
         st.subheader("🔊 Generated speech")
         st.audio(generated_wav, format="audio/wav")
         st.divider()
-        render_metrics_dashboard(
-            audio, sample_rate, generated_wav, transcript,
-            input_seconds, asr_seconds, tts_seconds, generated_seconds,
-        )
+        try:
+            render_metrics_dashboard(
+                audio, sample_rate, generated_wav, transcript,
+                input_seconds, asr_seconds, tts_seconds, generated_seconds,
+            )
+        except Exception:
+            logger.exception("Live speech metrics rendering failed")
+            st.warning("Speech generation succeeded, but its metrics and charts could not be displayed.")
     except Exception as exc:
+        logger.exception("Live speech processing failed")
         st.error(f"Processing failed: {type(exc).__name__}: {exc}")
 
 
