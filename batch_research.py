@@ -69,7 +69,10 @@ def run_mfa(audio, sr, transcript, dictionary, acoustic, command="mfa"):
     import textgrid
     executable = shutil.which(command)
     if not executable:
-        raise RuntimeError("MFA command unavailable. Install Montreal Forced Aligner separately.")
+        raise RuntimeError(
+            "MFA command not found on PATH. Rebuild the Space using this project's Dockerfile "
+            "to install Montreal Forced Aligner."
+        )
     if not dictionary or not acoustic:
         raise ValueError("An MFA pronunciation dictionary and compatible acoustic model are required.")
     with tempfile.TemporaryDirectory(prefix="speech_mfa_") as folder:
@@ -79,7 +82,7 @@ def run_mfa(audio, sr, transcript, dictionary, acoustic, command="mfa"):
         output.mkdir()
         sf.write(corpus / "sample.wav", audio, sr, subtype="PCM_16")
         (corpus / "sample.lab").write_text(transcript.strip(), encoding="utf-8")
-        cmd = [executable, "align", str(corpus), dictionary, acoustic, str(output), "--clean", "--single_speaker"]
+        cmd = [executable, "align", str(corpus), dictionary, acoustic, str(output), "--clean"]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if proc.returncode:
             raise RuntimeError((proc.stderr or proc.stdout)[-900:])
@@ -101,12 +104,6 @@ def render_batch_tab():
     st.subheader("Batch research · multi-file analysis")
     st.caption("Upload audio and matching transcript files to prefill references automatically. Compare ASR/TTS, acoustic embeddings and optional IndicMFA alignment.")
     uploads = st.file_uploader("Audio recordings", type=AUDIO_EXTENSIONS, accept_multiple_files=True, key="batch_audio")
-    reference_csv = st.file_uploader(
-        "Optional reference CSV (columns: filename, reference, language)",
-        type=["csv"],
-        help="Use this only if you prefer a spreadsheet. Matching CSV rows override .txt transcripts.",
-        key="batch_csv",
-    )
     reference_files = st.file_uploader(
         "Reference transcripts (.txt, UTF-8; automatically matched by filename)",
         type=["txt"],
@@ -132,16 +129,6 @@ def render_batch_tab():
                     st.error(f"Reference file '{reference_file.name}' must be UTF-8 text.")
                     return
                 ref_map[key] = (text, "hi", "TXT")
-        if reference_csv:
-            refs = pd.read_csv(io.BytesIO(reference_csv.getvalue())).fillna("")
-            if not {"filename", "reference"}.issubset(refs.columns):
-                st.error("CSV must include filename and reference columns.")
-                return
-            for _, row in refs.iterrows():
-                csv_name = str(row["filename"]).strip()
-                csv_reference = (str(row["reference"]), str(row.get("language", "hi")) or "hi", "CSV")
-                ref_map[csv_name.casefold()] = csv_reference
-                ref_map[Path(csv_name).stem.casefold()] = csv_reference
         metadata_rows = []
         for upload in uploads:
             audio_stem = Path(upload.name).stem.casefold()
@@ -157,16 +144,6 @@ def render_batch_tab():
             st.success(f"Automatically matched references for {matched_count} of {len(uploads)} audio files.")
         else:
             st.info("No references matched yet. Upload same-stem .txt files (for example, clip1.wav + clip1.txt), or edit the table below.")
-        template = pd.DataFrame([
-            {"filename": upload.name, "reference": "", "language": "hi"}
-            for upload in uploads
-        ])
-        st.download_button(
-            "Download blank reference CSV template",
-            template.to_csv(index=False).encode("utf-8"),
-            "batch_reference_template.csv",
-            "text/csv",
-        )
         st.caption("Language defaults to Hindi (hi); change it to Sanskrit (sa) in the table when needed.")
         edited = st.data_editor(metadata, hide_index=True, width="stretch", num_rows="fixed", key="batch_metadata")
         asr = st.multiselect("Batch ASR models", list(ASR_ENGINES), default=["koyal"],
@@ -182,7 +159,7 @@ def render_batch_tab():
         enable_mfa = st.toggle("IndicMFA forced word alignment", value=False, key="batch_mfa")
         dictionaries, acoustics = {}, {}
         if enable_mfa:
-            st.info("MFA requires a separately installed CLI. Project-local dictionaries and acoustic model archives are prefilled when present; paths can be changed below.")
+            st.info("MFA is installed by this project's Dockerfile for Hugging Face Spaces. Project-local dictionaries and acoustic model archives are prefilled when present; paths can be changed below.")
             project_dir = Path(__file__).resolve().parent
             mfa_assets = {
                 "hi": ("Hindi_Dict_g2g.txt", "Hindi_All_Acoustic.zip"),
