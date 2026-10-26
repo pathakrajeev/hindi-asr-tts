@@ -3,6 +3,7 @@ torch==2.6.0
 torchaudio==2.6.0
 nemo_toolkit[asr]>=3.0,<4
 transformers==4.46.1
+accelerate>=0.26,<2
 parler-tts @ git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68
 huggingface_hub>=0.27
 onnx==1.16.2
@@ -18,3 +19,6 @@ soundfile>=0.12
 requests>=2.31
 numpy>=1.26
 python-dotenv>=1.0,<2
+
+# Optional MFA TextGrid parsing (MFA executable/model assets installed separately)
+textgrid>=1.6
