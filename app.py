@@ -5,6 +5,9 @@ from pathlib import Path
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import librosa
 import librosa.display
@@ -22,6 +25,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 st.set_page_config(page_title="Hindi ASR → TTS Pipeline", page_icon="🗣️", layout="centered")
 
 from research import render_research_tab  # noqa: E402
+from batch_research import render_batch_tab  # noqa: E402
 from speech_core import (
     EmptyTranscriptError,
     LIVE_ASR_WINDOW_SECONDS,
@@ -288,7 +292,7 @@ def render_mode_overview(mode: str) -> None:
 st.title("🗣️ Hindi ASR → TTS Pipeline")
 mode = st.radio(
     "Choose a workflow",
-    ["Live", "Research"],
+    ["Live", "Research", "Batch Research"],
     horizontal=True,
     key="app_mode",
 )
@@ -301,5 +305,7 @@ if problem:
 
 if mode == "Live":
     render_live_tab()
-else:
+elif mode == "Research":
     render_research_tab()
+else:
+    render_batch_tab()
