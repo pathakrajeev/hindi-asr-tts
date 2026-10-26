@@ -99,23 +99,75 @@ def run_mfa(audio, sr, transcript, dictionary, acoustic, command="mfa"):
 
 def render_batch_tab():
     st.subheader("Batch research · multi-file analysis")
-    st.caption("Upload multiple recordings and map each to a verified reference. Compare ASR/TTS, acoustic embeddings and optional IndicMFA alignment.")
+    st.caption("Upload audio and matching transcript files to prefill references automatically. Compare ASR/TTS, acoustic embeddings and optional IndicMFA alignment.")
     uploads = st.file_uploader("Audio recordings", type=AUDIO_EXTENSIONS, accept_multiple_files=True, key="batch_audio")
-    reference_csv = st.file_uploader("Reference CSV (columns: filename, reference, language)", type=["csv"], key="batch_csv")
+    reference_csv = st.file_uploader(
+        "Optional reference CSV (columns: filename, reference, language)",
+        type=["csv"],
+        help="Use this only if you prefer a spreadsheet. Matching CSV rows override .txt transcripts.",
+        key="batch_csv",
+    )
+    reference_files = st.file_uploader(
+        "Reference transcripts (.txt, UTF-8; automatically matched by filename)",
+        type=["txt"],
+        accept_multiple_files=True,
+        help="For example, upload recording.wav and recording.txt. The text file contains only the correct transcript.",
+        key="batch_txt",
+    )
     if not uploads:
         st.session_state.pop("batch_results", None)
         st.info("Upload WAV/MP3/FLAC/etc. files. Each file is limited to 120 seconds and 50 MB.")
         return
     try:
         ref_map = {}
+        if reference_files:
+            for reference_file in reference_files:
+                key = Path(reference_file.name).stem.casefold()
+                if key in ref_map:
+                    st.error(f"More than one reference file matches the filename stem '{Path(reference_file.name).stem}'.")
+                    return
+                try:
+                    text = reference_file.getvalue().decode("utf-8-sig").strip()
+                except UnicodeDecodeError:
+                    st.error(f"Reference file '{reference_file.name}' must be UTF-8 text.")
+                    return
+                ref_map[key] = (text, "hi", "TXT")
         if reference_csv:
             refs = pd.read_csv(io.BytesIO(reference_csv.getvalue())).fillna("")
             if not {"filename", "reference"}.issubset(refs.columns):
                 st.error("CSV must include filename and reference columns.")
                 return
-            ref_map = {str(r["filename"]): (str(r["reference"]), str(r.get("language", "hi"))) for _, r in refs.iterrows()}
-        metadata = pd.DataFrame([{"filename": f.name, "reference": ref_map.get(f.name, ("", "hi"))[0],
-                                  "language": ref_map.get(f.name, ("", "hi"))[1] or "hi"} for f in uploads])
+            for _, row in refs.iterrows():
+                csv_name = str(row["filename"]).strip()
+                csv_reference = (str(row["reference"]), str(row.get("language", "hi")) or "hi", "CSV")
+                ref_map[csv_name.casefold()] = csv_reference
+                ref_map[Path(csv_name).stem.casefold()] = csv_reference
+        metadata_rows = []
+        for upload in uploads:
+            audio_stem = Path(upload.name).stem.casefold()
+            reference = ref_map.get(upload.name.casefold(), ref_map.get(audio_stem, ("", "hi", "")))
+            metadata_rows.append({
+                "filename": upload.name,
+                "reference": reference[0],
+                "language": reference[1] or "hi",
+            })
+        metadata = pd.DataFrame(metadata_rows)
+        matched_count = sum(bool(normalize_reference_text(row["reference"])) for row in metadata_rows)
+        if matched_count:
+            st.success(f"Automatically matched references for {matched_count} of {len(uploads)} audio files.")
+        else:
+            st.info("No references matched yet. Upload same-stem .txt files (for example, clip1.wav + clip1.txt), or edit the table below.")
+        template = pd.DataFrame([
+            {"filename": upload.name, "reference": "", "language": "hi"}
+            for upload in uploads
+        ])
+        st.download_button(
+            "Download blank reference CSV template",
+            template.to_csv(index=False).encode("utf-8"),
+            "batch_reference_template.csv",
+            "text/csv",
+        )
+        st.caption("Language defaults to Hindi (hi); change it to Sanskrit (sa) in the table when needed.")
         edited = st.data_editor(metadata, hide_index=True, width="stretch", num_rows="fixed", key="batch_metadata")
         asr = st.multiselect("Batch ASR models", list(ASR_ENGINES), default=["koyal"],
                              format_func=lambda x: ASR_ENGINES[x]["label"], key="batch_asr")
@@ -130,11 +182,33 @@ def render_batch_tab():
         enable_mfa = st.toggle("IndicMFA forced word alignment", value=False, key="batch_mfa")
         dictionaries, acoustics = {}, {}
         if enable_mfa:
-            st.info("MFA requires a separately installed CLI and language-compatible dictionary + acoustic model. No model is downloaded automatically.")
+            st.info("MFA requires a separately installed CLI. Project-local dictionaries and acoustic model archives are prefilled when present; paths can be changed below.")
+            project_dir = Path(__file__).resolve().parent
+            mfa_assets = {
+                "hi": ("Hindi_Dict_g2g.txt", "Hindi_All_Acoustic.zip"),
+                "sa": ("Sanskrit_Dict.txt", "Sanskrit_Acoustic_Model.zip"),
+            }
             for lang in ("hi", "sa"):
                 a, b = st.columns(2)
-                dictionaries[lang] = a.text_input(f"{lang} dictionary path/model", value=os.getenv(f"INDICMFA_{lang.upper()}_DICTIONARY", ""))
-                acoustics[lang] = b.text_input(f"{lang} acoustic model path/name", value=os.getenv(f"INDICMFA_{lang.upper()}_ACOUSTIC", ""))
+                dictionary_file, acoustic_file = mfa_assets[lang]
+                dictionary_default = os.getenv(
+                    f"INDICMFA_{lang.upper()}_DICTIONARY",
+                    str(project_dir / dictionary_file) if (project_dir / dictionary_file).is_file() else "",
+                )
+                acoustic_default = os.getenv(
+                    f"INDICMFA_{lang.upper()}_ACOUSTIC",
+                    str(project_dir / acoustic_file) if (project_dir / acoustic_file).is_file() else "",
+                )
+                dictionaries[lang] = a.text_input(
+                    f"{lang} dictionary path/model",
+                    value=dictionary_default,
+                    key=f"batch_mfa_{lang}_dictionary",
+                )
+                acoustics[lang] = b.text_input(
+                    f"{lang} acoustic model path/name",
+                    value=acoustic_default,
+                    key=f"batch_mfa_{lang}_acoustic",
+                )
         run = st.button("Run batch analysis", type="primary", disabled=not bool(asr) or not bool(uploads))
         if run:
             st.session_state.pop("batch_results", None)
