@@ -1,4 +1,4 @@
-FROM condaforge/miniforge3:24.11.0-0
+FROM condaforge/miniforge3:24.11.3-0
 
 ENV PYTHONUNBUFFERED=1 \
     USE_TF=0 \
