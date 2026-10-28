@@ -24,8 +24,11 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 st.set_page_config(page_title="Hindi ASR → TTS Pipeline", page_icon="🗣️", layout="centered")
 
+import hashlib  # noqa: E402
+
 from research import render_research_tab  # noqa: E402
 from batch_research import render_batch_tab  # noqa: E402
+from deepfake import render_synthetic_mode  # noqa: E402
 from speech_core import (
     EmptyTranscriptError,
     LIVE_ASR_WINDOW_SECONDS,
@@ -94,7 +97,9 @@ def render_metrics_dashboard(
     analysis_tabs = st.tabs(["Audio Metrics", "Audio Diagnostics", "Prosody", "Pipeline Performance"])
 
     with analysis_tabs[0]:
-        st.caption("Words per minute, spectral centroid, zero-crossing rate, and RMS/Peak levels.")
+        st.caption("Words per minute, spectral centroid, zero-crossing rate, and RMS/Peak levels. "
+                   "The input is peak-limited to 0.95 (about −0.45 dBFS) when decoded, so its peak and RMS "
+                   "describe the scaled signal, not the original recording level.")
         st.dataframe(
             [
                 {
@@ -156,8 +161,10 @@ def render_metrics_dashboard(
     with analysis_tabs[3]:
         asr_rtf = asr_seconds / input_seconds if input_seconds else 0.0
         tts_rtf = tts_seconds / generated_seconds if generated_seconds else 0.0
+        st.caption("ASR time is Koyal inference only (model loading excluded). TTS time is the Bulbul request time. "
+                   "Decoding and chart rendering are not included.")
         columns = st.columns(3)
-        columns[0].metric("Total processing (s)", f"{asr_seconds + tts_seconds:.2f}")
+        columns[0].metric("ASR + TTS processing (s)", f"{asr_seconds + tts_seconds:.2f}")
         columns[1].metric("ASR real-time factor", f"{asr_rtf:.3f}", help="ASR processing time divided by input audio duration; lower is faster.")
         columns[2].metric("TTS real-time factor", f"{tts_rtf:.3f}", help="TTS processing time divided by generated audio duration; lower is faster.")
         fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
@@ -191,16 +198,26 @@ def render_live_tab() -> None:
         source_name = getattr(source, "name", "recording.wav")
         size_mb = len(raw) / (1024 * 1024)
         st.caption(f"Selected: {source_name} · {size_mb:.1f} MB")
-    if not st.button(
+    source_digest = hashlib.sha256(source.getvalue()).hexdigest() if source is not None else None
+    stored = st.session_state.get("live_result")
+    if stored is not None and stored["digest"] != source_digest:
+        st.session_state.pop("live_result", None)  # new or removed audio: old result no longer applies
+        stored = None
+    if st.button(
         "Transcribe and speak",
         type="primary",
         width="stretch",
         key="live_process",
     ):
-        return
-    if source is None:
-        st.error("Record or upload audio before starting transcription.")
-        return
+        if source is None:
+            st.error("Record or upload audio before starting transcription.")
+            return
+        stored = _process_live(source, source_digest)
+    if stored is not None:
+        _render_live_result(stored)
+
+
+def _process_live(source, source_digest):
     raw = source.getvalue()
     try:
         with st.status("Processing live audio…", expanded=True) as status:
@@ -208,10 +225,9 @@ def render_live_tab() -> None:
                 raw, Path(getattr(source, "name", "recording.wav")).suffix, MAX_AUDIO_SECONDS
             )
             if input_seconds > LIVE_ASR_WINDOW_SECONDS:
-                segment_count = int(np.ceil(input_seconds / LIVE_ASR_WINDOW_SECONDS))
                 st.write(
                     f"Transcribing {input_seconds / 60:.1f} minutes with Koyal "
-                    f"in {segment_count} segments…"
+                    f"in speech-aware windows of up to {LIVE_ASR_WINDOW_SECONDS} s…"
                 )
             else:
                 st.write("Transcribing with Koyal…")
@@ -224,21 +240,13 @@ def render_live_tab() -> None:
                 ),
             )
             status.update(label="Complete", state="complete", expanded=False)
-        st.subheader("📝 Transcript")
-        st.write(transcript)
-        if tts_chunks > 1:
-            st.caption(f"Speech was generated in {tts_chunks} chunks to fit the TTS service limit.")
-        st.subheader("🔊 Generated speech")
-        st.audio(media_data_uri(generated_wav, "audio/wav"), format="audio/wav")
-        st.divider()
-        try:
-            render_metrics_dashboard(
-                audio, sample_rate, generated_wav, transcript,
-                input_seconds, asr_seconds, tts_seconds, generated_seconds,
-            )
-        except Exception:
-            logger.exception("Live speech metrics rendering failed")
-            st.warning("Speech generation succeeded, but its metrics and charts could not be displayed.")
+        result = {
+            "digest": source_digest, "audio": audio, "sample_rate": sample_rate, "input_seconds": input_seconds,
+            "transcript": transcript, "asr_seconds": asr_seconds, "generated_wav": generated_wav,
+            "tts_seconds": tts_seconds, "generated_seconds": generated_seconds, "tts_chunks": tts_chunks,
+        }
+        st.session_state["live_result"] = result
+        return result
     except EmptyTranscriptError as exc:
         logger.warning("Live ASR produced no transcript: %s", exc.diagnostics)
         st.error("Koyal did not recognize any words in this recording.")
@@ -251,6 +259,25 @@ def render_live_tab() -> None:
     except Exception as exc:
         logger.exception("Live speech processing failed")
         st.error(f"Processing failed: {type(exc).__name__}: {exc}")
+    return None
+
+
+def _render_live_result(result) -> None:
+    st.subheader("📝 Transcript")
+    st.write(result["transcript"])
+    if result["tts_chunks"] > 1:
+        st.caption(f"Speech was generated in {result['tts_chunks']} chunks to fit the TTS service limit.")
+    st.subheader("🔊 Generated speech")
+    st.audio(media_data_uri(result["generated_wav"], "audio/wav"), format="audio/wav")
+    st.divider()
+    try:
+        render_metrics_dashboard(
+            result["audio"], result["sample_rate"], result["generated_wav"], result["transcript"],
+            result["input_seconds"], result["asr_seconds"], result["tts_seconds"], result["generated_seconds"],
+        )
+    except Exception:
+        logger.exception("Live speech metrics rendering failed")
+        st.warning("Speech generation succeeded, but its metrics and charts could not be displayed.")
 
 
 def render_mode_overview(mode: str) -> None:
@@ -274,15 +301,30 @@ def render_mode_overview(mode: str) -> None:
             Live mode does not require a reference transcript, so it does not report
             reference-based WER or CER.
             """)
+        elif mode == "Synthetic speech":
+            st.markdown("""
+            **Synthetic speech (deepfake) detection**
+            1. *Check a file*: score any clip with a zero-shot Indic detector and, once trained, your own detector.
+            2. *Build dataset*: add the last Batch Research run (inputs = real, TTS outputs = synthetic) and any
+               labelled files; every clip gets the same loudness and MP3 codec treatment.
+            3. *Train & evaluate*: WavLM embeddings + logistic regression, tested on unseen speakers and on
+               TTS engines left out of training (AUC, EER, Brier).
+
+            Scores are research evidence, not proof that a recording is genuine or fake.
+            """)
         else:
             st.markdown("""
             **Research pipeline**
             1. Provide a golden-reference transcript and record or upload audio
                (up to 120 seconds).
-            2. Select ASR and TTS models to compare on the same recording.
-            3. Review preprocessing and VAD diagnostics, WER/CER and word-level
-               alignment, model latency and real-time factor, TTS loopback and
-               optional UTMOS scores, plus prosody and voice measurements.
+            2. Choose the language variety (Hindi, Hindi-English code-mixed, Sanskrit) and the
+               ASR and TTS models to compare on the same recording. Unsupported model-language
+               pairs are reported, not run.
+            3. Review preprocessing and VAD diagnostics, normalized / raw / script-tolerant WER,
+               CER and word-level alignment, inference latency and real-time factor (model
+               loading shown separately), TTS loopback and optional UTMOS scores, voice control,
+               prosody and voice measurements, and an optional synthetic-speech check.
+            4. Batch Research adds corpus WER/CER with 95% confidence intervals per variety.
 
             Local models load only when selected. Model availability and memory
             requirements vary by deployment.
@@ -292,20 +334,25 @@ def render_mode_overview(mode: str) -> None:
 st.title("🗣️ Hindi ASR → TTS Pipeline")
 mode = st.radio(
     "Choose a workflow",
-    ["Live", "Research", "Batch Research"],
+    ["Live", "Research", "Batch Research", "Synthetic speech"],
     horizontal=True,
     key="app_mode",
 )
 render_mode_overview(mode)
 
-problem = dependency_message()
-if problem:
-    st.error(problem)
-    st.stop()
+# Live always uses Koyal (gated, HF_TOKEN) and Bulbul (SARVAM_API_KEY). The other modes warn
+# about missing secrets only for the models actually selected.
+if mode == "Live":
+    problem = dependency_message(("HF_TOKEN", "SARVAM_API_KEY"))
+    if problem:
+        st.error(problem)
+        st.stop()
 
 if mode == "Live":
     render_live_tab()
 elif mode == "Research":
     render_research_tab()
-else:
+elif mode == "Batch Research":
     render_batch_tab()
+else:
+    render_synthetic_mode()

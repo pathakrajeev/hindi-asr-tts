@@ -25,12 +25,19 @@ import streamlit as st
 import torch
 
 from speech_core import (
+    LANGUAGES,
+    PRIMARY_LABEL,
     SAMPLE_RATE,
+    build_windows,
     decode_audio,
+    guess_language,
     load_koyal,
+    load_vad,
     media_data_uri,
+    missing_secrets,
     nemo_transcribe_segments,
     normalize_reference_text,
+    run_vad,
     score_transcript,
     secret,
     synthesize,
@@ -77,6 +84,15 @@ PARLER_DESCRIPTION = (
     "Divya, a female speaker, speaks Hindi at a moderate pace with balanced pitch and slight "
     "expressiveness. The recording is very clear, close-sounding, and has almost no background noise."
 )
+# Indic Parler-TTS recommended Sanskrit speaker (as used by the notebook). Aryan is male, so
+# Sanskrit TTS cannot meet the female voice control.
+PARLER_DESCRIPTION_SA = (
+    "Aryan, a male speaker, speaks Sanskrit at a moderate pace with balanced pitch. "
+    "The recording is very clear, close-sounding, and has almost no background noise."
+)
+PARLER_CHUNK_CHARS = 180  # same as the notebook's parler_chunk_chars
+TARGET_VOICE = "female"   # thesis control: TTS engines are ranked only on confirmed-female voices
+HEARD_VOICE_OPTIONS = ["not checked", "female", "male", "unsure"]
 
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 REFERENCE_COLOR = "#52514e"
@@ -95,6 +111,35 @@ TTS_ENGINES = {
     "indic-parler-tts": {"label": "Indic Parler-TTS", "memory": "~3.5 GB", "heavy": True},
 }
 ASR_COLORS = {key: PALETTE[index] for index, key in enumerate(ASR_ENGINES)}
+
+# Which engine may run on which variety. (supported, note shown in the results).
+# Mirrors the notebook's routing: unsupported pairs are reported, never run.
+_SUPPORT = {
+    "koyal": {"hi": (True, ""),
+              "hi-en": (True, "Monolingual Hindi model; English words are expected in Devanagari."),
+              "sa": (False, "Koyal is a Hindi-only model.")},
+    "sarvam-saaras-v3": {"hi": (True, ""), "hi-en": (True, ""),
+                         "sa": (True, "No Sanskrit language code; sent as hi-IN.")},
+    "whisper-large-v3-turbo": {"hi": (True, ""),
+                               "hi-en": (True, "Decoder language not forced for code-mixed speech."),
+                               "sa": (True, "Whisper Sanskrit decoder (sa).")},
+    "indic-conformer-ctc": {"hi": (True, ""), "hi-en": (True, "Hindi decoder on code-mixed speech."),
+                            "sa": (True, "")},
+    "indic-conformer-rnnt": {"hi": (True, ""), "hi-en": (True, "Hindi decoder on code-mixed speech."),
+                             "sa": (True, "")},
+    "sravaani": {"hi": (True, ""), "hi-en": (True, ""), "sa": (True, "")},
+    "bulbul-v3": {"hi": (True, ""), "hi-en": (True, ""),
+                  "sa": (False, "No configured Sanskrit support in Bulbul v3.")},
+    "mms-tts-hin": {"hi": (True, ""),
+                    "hi-en": (True, "Latin-script words may be mispronounced (model limitation)."),
+                    "sa": (False, "No validated Sanskrit MMS checkpoint configured.")},
+    "indic-parler-tts": {"hi": (True, ""), "hi-en": (True, ""),
+                         "sa": (True, "Sanskrit voice Aryan (male): outside the female voice control.")},
+}
+
+
+def engine_support(key: str, language: str) -> tuple[bool, str]:
+    return _SUPPORT.get(key, {}).get(language, (True, ""))
 INPUT_LABEL = "Input speech"
 TTS_COLORS = {INPUT_LABEL: REFERENCE_COLOR} | {
     TTS_ENGINES[key]["label"]: PALETTE[index] for index, key in enumerate(TTS_ENGINES)
@@ -102,13 +147,6 @@ TTS_COLORS = {INPUT_LABEL: REFERENCE_COLOR} | {
 
 
 # ---------------------------------------------------------------- model loaders
-
-
-@st.cache_resource(show_spinner=False)
-def load_vad():
-    from silero_vad import load_silero_vad
-
-    return load_silero_vad()
 
 
 @st.cache_resource(show_spinner=False)
@@ -283,8 +321,19 @@ RELEASERS = {
     "indic-conformer-ctc": load_indic_conformer,
     "indic-conformer-rnnt": load_indic_conformer,
     "sravaani": load_sravaani,
+    "mms-tts-hin": load_mms,
     "indic-parler-tts": load_parler,
 }
+# Loaders are called in their own timed step, so latency and RTF measure inference only.
+LOADERS = RELEASERS
+
+
+def release_unless_needed(key: str, upcoming: list[str]) -> None:
+    """Release a local model unless a later step uses the same loader (CTC and RNNT share one)."""
+    loader = RELEASERS.get(key)
+    if loader is None or any(RELEASERS.get(k) is loader for k in upcoming):
+        return
+    release(key)
 
 
 def release(key: str) -> None:
@@ -317,21 +366,6 @@ def normalize_rms(y: np.ndarray) -> np.ndarray:
     if peak > ceiling:
         z = z / peak * ceiling
     return z.astype(np.float32)
-
-
-def run_vad(y: np.ndarray, sr: int) -> list[dict]:
-    from silero_vad import get_speech_timestamps
-
-    stamps = get_speech_timestamps(
-        torch.from_numpy(np.asarray(y, np.float32)),
-        load_vad(),
-        sampling_rate=sr,
-        threshold=0.5,
-        min_speech_duration_ms=250,
-        min_silence_duration_ms=150,
-        speech_pad_ms=120,
-    )
-    return [{"start": int(s["start"]), "end": int(s["end"])} for s in stamps]
 
 
 def speech_mask(n: int, segments: list[dict]) -> np.ndarray:
@@ -387,23 +421,9 @@ def adaptive_denoise(y: np.ndarray, sr: int, segments: list[dict]) -> dict:
     return result
 
 
-def build_windows(n: int, sr: int, segments: list[dict]) -> list[tuple[int, int]]:
-    max_len = int(MAX_WINDOW_SECONDS * sr)
-    vad_ends = sorted({min(n, s["end"]) for s in segments if 0 < s["end"] <= n})
-    windows, start = [], 0
-    while start < n:
-        hard_end = min(n, start + max_len)
-        if hard_end >= n:
-            end = n
-        else:
-            legal = [b for b in vad_ends if start + 2 * sr <= b <= hard_end]
-            end = max(legal) if legal else hard_end
-        windows.append((start, end))
-        start = end
-    return windows
-
-
-def preprocess(y: np.ndarray, sr: int, denoise: bool) -> dict:
+def preprocess(y: np.ndarray, sr: int, denoise: bool, clipping_fraction: float | None = None) -> dict:
+    """clipping_fraction should come from decode_audio(return_info=True): measured before
+    peak scaling. Measured here it would always be 0, because decode scales peaks to 0.95."""
     normalized = normalize_rms(y)
     segments = run_vad(normalized, sr)
     cleaned = adaptive_denoise(normalized, sr, segments) if denoise else {
@@ -418,7 +438,8 @@ def preprocess(y: np.ndarray, sr: int, denoise: bool) -> dict:
         "vad": segments,
         "windows": build_windows(len(normalized), sr, segments),
         "speech_fraction": float(mask.mean()) if len(mask) else 0.0,
-        "clipping_fraction": float(np.mean(np.abs(y) >= 0.999)),
+        "clipping_fraction": (float(clipping_fraction) if clipping_fraction is not None
+                              else float(np.mean(np.abs(y) >= 0.999))),
         "input_rms_dbfs": rms_dbfs(y),
         **cleaned,
     }
@@ -457,6 +478,7 @@ def asr_sarvam(y, sr, windows, options):
                 "https://api.sarvam.ai/speech-to-text",
                 headers={"api-subscription-key": secret("SARVAM_API_KEY")},
                 files={"file": ("audio.wav", wav.getvalue(), "audio/wav")},
+                # No Sanskrit code is configured; Sanskrit is sent as hi-IN (see engine_support).
                 data={"model": "saaras:v3", "mode": options["sarvam_mode"], "language_code": "hi-IN"},
                 timeout=120,
             )
@@ -472,11 +494,16 @@ def asr_sarvam(y, sr, windows, options):
 
 def asr_whisper(y, sr, windows, options):
     model, processor = load_whisper()
+    language = options.get("language", "hi")
+    # Code-mixed speech: let Whisper pick the language per window instead of forcing Hindi.
+    generate_args = {"task": "transcribe", "max_new_tokens": 384}
+    if language in ("hi", "sa"):
+        generate_args["language"] = language
     texts = []
     for segment in _segments(y, windows):
         features = processor(segment, sampling_rate=sr, return_tensors="pt").input_features
         with torch.inference_mode():
-            tokens = model.generate(features, language="hi", task="transcribe", max_new_tokens=384)
+            tokens = model.generate(features, **generate_args)
         texts.append(processor.batch_decode(tokens, skip_special_tokens=True)[0].strip())
     return " ".join(texts)
 
@@ -484,10 +511,11 @@ def asr_whisper(y, sr, windows, options):
 def _asr_indic_conformer(decoder):
     def run(y, sr, windows, options):
         model = load_indic_conformer()
+        language = "sa" if options.get("language") == "sa" else "hi"
         texts = []
         with torch.inference_mode():
             for segment in _segments(y, windows):
-                texts.append(_text_from(model(torch.from_numpy(segment).unsqueeze(0), "hi", decoder)))
+                texts.append(_text_from(model(torch.from_numpy(segment).unsqueeze(0), language, decoder)))
         return " ".join(texts)
 
     return run
@@ -550,9 +578,15 @@ ASR_RUNNERS = {
 
 
 def sentence_chunks(text: str, max_chars: int) -> list[str]:
+    """Pack sentences into chunks of at most max_chars, keeping the original order."""
     sentences = [s.strip() for s in re.split(r"(?<=[।॥!?.])\s+", text) if s.strip()]
     chunks, current = [], ""
     for sentence in sentences:
+        if len(sentence) > max_chars and current:
+            # Fix: flush the buffered earlier sentence BEFORE emitting pieces of a long one;
+            # previously the long sentence's pieces jumped ahead of it.
+            chunks.append(current)
+            current = ""
         while len(sentence) > max_chars:
             cut = sentence.rfind(" ", 0, max_chars)
             cut = cut if cut > 0 else max_chars
@@ -579,13 +613,13 @@ def sentence_safe_prefix(text: str, max_chars: int) -> tuple[str, bool]:
     return prefix[: cut + 1 if cut > 0 else max_chars].strip(), True
 
 
-def tts_bulbul(text):
+def tts_bulbul(text, language="hi"):
     wav, elapsed, _ = synthesize(text)
     audio, sr = sf.read(io.BytesIO(wav), dtype="float32", always_2d=False)
     return np.asarray(audio, np.float32), int(sr), elapsed
 
 
-def tts_mms(text):
+def tts_mms(text, language="hi"):
     model, tokenizer = load_mms()
     if getattr(tokenizer, "is_uroman", False):
         raise RuntimeError("This MMS checkpoint needs uroman romanization, which is not installed.")
@@ -605,22 +639,32 @@ def tts_mms(text):
     return np.concatenate(parts[:-1]).astype(np.float32), sr, time.perf_counter() - started
 
 
-def tts_parler(text):
+def tts_parler(text, language="hi"):
+    """Sentence-chunked Parler synthesis. One 2048-token generate call holds only ~24 s of
+    audio, so long texts were silently cut off; chunks of <=180 characters avoid that."""
     model, prompt_tokenizer, description_tokenizer = load_parler()
-    description = description_tokenizer(PARLER_DESCRIPTION, return_tensors="pt")
-    prompt = prompt_tokenizer(text, return_tensors="pt")
-    torch.manual_seed(TTS_SEED)
+    description_text = PARLER_DESCRIPTION_SA if language == "sa" else PARLER_DESCRIPTION
+    description = description_tokenizer(description_text, return_tensors="pt")
+    sr = int(model.config.sampling_rate)
+    silence = np.zeros(int(0.18 * sr), dtype=np.float32)
+    parts = []
     started = time.perf_counter()
     with torch.inference_mode():
-        audio = model.generate(
-            input_ids=description.input_ids,
-            attention_mask=description.attention_mask,
-            prompt_input_ids=prompt.input_ids,
-            prompt_attention_mask=prompt.attention_mask,
-            max_new_tokens=2048,
-        )
+        for chunk in sentence_chunks(text, PARLER_CHUNK_CHARS):
+            torch.manual_seed(TTS_SEED)
+            prompt = prompt_tokenizer(chunk, return_tensors="pt")
+            audio = model.generate(
+                input_ids=description.input_ids,
+                attention_mask=description.attention_mask,
+                prompt_input_ids=prompt.input_ids,
+                prompt_attention_mask=prompt.attention_mask,
+                max_new_tokens=2048,
+            )
+            parts += [audio.float().cpu().numpy().squeeze().astype(np.float32), silence]
     elapsed = time.perf_counter() - started
-    return audio.float().cpu().numpy().squeeze().astype(np.float32), int(model.config.sampling_rate), elapsed
+    if not parts:
+        raise RuntimeError("Indic Parler-TTS produced no audio for this text.")
+    return np.concatenate(parts[:-1]).astype(np.float32), sr, elapsed
 
 
 TTS_RUNNERS = {"bulbul-v3": tts_bulbul, "mms-tts-hin": tts_mms, "indic-parler-tts": tts_parler}
@@ -757,7 +801,9 @@ def _corr(a, b) -> float:
     return float(np.corrcoef(a, b)[0, 1]) if a is not None and b is not None else float("nan")
 
 
-def compare_prosody(reference: dict, candidate: dict) -> dict:
+def compare_prosody(reference: dict, candidate: dict, truncated: bool = False) -> dict:
+    """truncated=True when the TTS text was cut to TTS_COMPARISON_MAX_CHARS: the generated
+    speech then covers less content than the input, so the duration ratio is not reported."""
     rm, cm = reference["metrics"], candidate["metrics"]
 
     def ratio(key):
@@ -777,7 +823,7 @@ def compare_prosody(reference: dict, candidate: dict) -> dict:
             _normalized_contour(candidate["energy_t"], candidate["energy_db"], False),
         ),
         "Pitch range ratio": ratio("F0 range (semitones)"),
-        "Duration ratio": ratio("Duration (s)"),
+        "Duration ratio": float("nan") if truncated else ratio("Duration (s)"),
         "Speech rate ratio": ratio("Speech rate (words/s)"),
         "Pause ratio |diff|": abs_diff("Internal pause ratio"),
         "Voiced ratio |diff|": abs_diff("Voiced ratio in speech"),
@@ -834,26 +880,50 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
             )
             return None, message
 
-    pre, error = step("Preprocessing (normalize, VAD, denoise)", preprocess, audio, sr, options["denoise"])
+    language = options.get("language", "hi")
+    judge = options["judge"]
+    pre, error = step("Preprocessing (normalize, VAD, denoise)", preprocess, audio, sr, options["denoise"],
+                      options.get("clipping_fraction"))
     if error:
         raise RuntimeError(f"Preprocessing failed: {error}")
     duration = len(audio) / sr
 
-    asr_rows = []
-    for key in options["asr"]:
+    def load_model(key, label):
+        """Load in its own timed step so latency/RTF below measure inference only."""
+        loader = LOADERS.get(key)
+        if loader is None:
+            return 0.0, None
         started = time.perf_counter()
-        text, error = step(f"ASR · {ASR_ENGINES[key]['label']}", ASR_RUNNERS[key], pre["processed"], sr, pre["windows"], options)
-        elapsed = time.perf_counter() - started
-        row = {"key": key, "label": ASR_ENGINES[key]["label"], "status": "failed" if error else "ok", "error": error,
-               "text": text or "", "latency": elapsed, "rtf": elapsed / duration}
+        _, error = step(f"Load · {label}", loader)
+        return time.perf_counter() - started, error
+
+    asr_rows = []
+    for index, key in enumerate(options["asr"]):
+        label = ASR_ENGINES[key]["label"]
+        supported, note = engine_support(key, language)
+        row = {"key": key, "label": label, "note": note, "text": "", "error": None,
+               "latency": float("nan"), "rtf": float("nan"), "load_seconds": float("nan")}
+        if not supported:
+            row |= {"status": "unsupported", "error": note}
+            log.append({"Step": f"ASR · {label}", "Status": "unsupported", "Seconds": 0.0, "Detail": note})
+            asr_rows.append(row)
+            continue
+        row["load_seconds"], error = load_model(key, label)
+        text = None
+        if not error:
+            started = time.perf_counter()
+            text, error = step(f"ASR · {label}", ASR_RUNNERS[key], pre["processed"], sr, pre["windows"], options)
+            elapsed = time.perf_counter() - started
+            row |= {"latency": elapsed, "rtf": elapsed / duration}
+        row |= {"status": "failed" if error else "ok", "error": error, "text": text or ""}
         if not error:
             if not row["text"]:
                 row |= {"status": "failed", "error": "Model returned an empty transcript."}
             else:
-                row |= score_transcript(reference_text, row["text"])
+                row |= score_transcript(reference_text, row["text"], language)
         asr_rows.append(row)
         if options["release"]:
-            release(key)
+            release_unless_needed(key, options["asr"][index + 1:] + ([judge] if judge else []))
 
     tts_text, source = reference_text, "Reference transcript"
     if options["tts_source"] != "reference":
@@ -866,9 +936,19 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
     tts_text, truncated = sentence_safe_prefix(tts_text, TTS_COMPARISON_MAX_CHARS)
 
     tts_rows = []
-    for key in options["tts"]:
-        result, error = step(f"TTS · {TTS_ENGINES[key]['label']}", TTS_RUNNERS[key], tts_text)
-        row = {"key": key, "label": TTS_ENGINES[key]["label"], "status": "failed" if error else "ok", "error": error}
+    for index, key in enumerate(options["tts"]):
+        label = TTS_ENGINES[key]["label"]
+        supported, note = engine_support(key, language)
+        if not supported:
+            tts_rows.append({"key": key, "label": label, "status": "unsupported", "error": note, "note": note})
+            log.append({"Step": f"TTS · {label}", "Status": "unsupported", "Seconds": 0.0, "Detail": note})
+            continue
+        load_seconds, error = load_model(key, label)
+        result = None
+        if not error:
+            result, error = step(f"TTS · {label}", TTS_RUNNERS[key], tts_text, language)
+        row = {"key": key, "label": label, "note": note, "load_seconds": load_seconds,
+               "status": "failed" if error else "ok", "error": error}
         if result:
             out, out_sr, elapsed = result
             out_duration = len(out) / out_sr
@@ -878,21 +958,24 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
                 row |= {"status": "failed", "error": "Model returned empty or invalid audio."}
         tts_rows.append(row)
         if options["release"]:
-            release(key)
+            release_unless_needed(key, options["tts"][index + 1:])
 
-    judge = options["judge"]
+    judge_ok = bool(judge) and engine_support(judge, language)[0]
+    if judge and not judge_ok:
+        log.append({"Step": "Loopback", "Status": "unsupported", "Seconds": 0.0,
+                    "Detail": f"{ASR_ENGINES[judge]['label']} does not support {LANGUAGES.get(language, language)}."})
     for row in (r for r in tts_rows if r["status"] == "ok"):
         speech = normalize_rms(_to_16k(row["audio"], row["sr"]))
         row["vad"], _ = step(f"VAD · {row['label']} output", run_vad, speech, SAMPLE_RATE)
         row["audio16"] = speech
-        if judge:
+        if judge_ok:
             text, error = step(f"Loopback · {row['label']} → {ASR_ENGINES[judge]['label']}",
                                ASR_RUNNERS[judge], speech, SAMPLE_RATE,
                                build_windows(len(speech), SAMPLE_RATE, row["vad"] or []), options)
             row["loopback_text"] = text or ""
             row["loopback_error"] = error
             if text:
-                row["loopback"] = score_transcript(tts_text, text)
+                row["loopback"] = score_transcript(tts_text, text, language)
         if options["utmos"]:
             row["utmos"], row["utmos_error"] = step(f"UTMOS · {row['label']}", predicted_utmos, row["audio"], row["sr"])
     if judge and options["release"]:
@@ -910,9 +993,20 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
         if value:
             prosody[row["label"]] = value
 
-    return {"audio": audio, "sr": sr, "reference": reference_text, "pre": pre, "asr": asr_rows,
-            "tts_text": tts_text, "tts_source": source, "tts_truncated": truncated, "tts": tts_rows,
-            "judge": ASR_ENGINES[judge]["label"] if judge else None, "prosody": prosody, "log": log}
+    synthetic = None
+    if options.get("deepfake"):
+        import deepfake
+
+        clips = [(INPUT_LABEL, "input (provenance unknown)", pre["normalized"], sr)]
+        clips += [(r["label"], "generated (known synthetic)", r["audio"], r["sr"])
+                  for r in tts_rows if r["status"] == "ok"]
+        synthetic, _ = step("Synthetic-speech check", deepfake.score_clips, clips,
+                            st.session_state.get("deepfake_detector"))
+
+    return {"audio": audio, "sr": sr, "reference": reference_text, "language": language, "pre": pre,
+            "asr": asr_rows, "tts_text": tts_text, "tts_source": source, "tts_truncated": truncated,
+            "tts": tts_rows, "judge": ASR_ENGINES[judge]["label"] if judge_ok else None,
+            "prosody": prosody, "synthetic": synthetic, "log": log}
 
 
 # ---------------------------------------------------------------- charts
@@ -1021,25 +1115,40 @@ def _alignment_html(ops) -> str:
 def render_asr(result):
     rows = result["asr"]
     ok = [r for r in rows if r["status"] == "ok"]
+    language = result.get("language", "hi")
+    primary = {"hi": "wer", "hi-en": "wer_script_tolerant", "sa": "cer"}.get(language, "wer")
+    st.caption(
+        f"Language: **{LANGUAGES.get(language, language)}** · headline metric: **{PRIMARY_LABEL[primary]}**. "
+        "Normalized = numbers to words, nukta and chandrabindu folding, acronyms, loanwords (the notebook's "
+        "scoring). Raw = punctuation and case only. Script-tolerant also accepts the same word written in "
+        "Latin and Devanagari. Latency and RTF exclude model loading (shown separately)."
+    )
     table = pd.DataFrame([{
         "Model": r["label"], "Status": r["status"],
-        "WER (%)": r.get("wer"), "CER (%)": r.get("cer"),
+        "WER norm (%)": r.get("wer"), "WER raw (%)": r.get("wer_raw"),
+        "WER script-tol. (%)": r.get("wer_script_tolerant"), "CER norm (%)": r.get("cer"),
         "Subs": r.get("substitutions"), "Dels": r.get("deletions"), "Ins": r.get("insertions"),
-        "Latency (s)": r["latency"], "RTF": r["rtf"],
+        "Latency (s)": r["latency"], "RTF": r["rtf"], "Load (s)": r.get("load_seconds"),
+        "Note": r.get("note", ""),
     } for r in rows])
     st.dataframe(table, hide_index=True, width="stretch", column_config={
-        c: st.column_config.NumberColumn(format="%.2f") for c in ("WER (%)", "CER (%)", "Latency (s)", "RTF")
+        c: st.column_config.NumberColumn(format="%.2f")
+        for c in ("WER norm (%)", "WER raw (%)", "WER script-tol. (%)", "CER norm (%)", "Latency (s)", "RTF", "Load (s)")
     })
     for r in rows:
-        if r["status"] != "ok":
+        if r["status"] == "unsupported":
+            st.info(f"**{r['label']}** not run — {r['error']}")
+        elif r["status"] != "ok":
             st.error(f"**{r['label']}** failed — {r['error']}")
     if not ok:
         return
 
-    frame = pd.DataFrame([{"Model": r["label"], "WER": r["wer"], "CER": r["cer"], "Latency": r["latency"], "RTF": r["rtf"]} for r in ok])
+    frame = pd.DataFrame([{"Model": r["label"], "Primary": r["primary"], "WER": r["wer"], "CER": r["cer"],
+                           "Latency": r["latency"], "RTF": r["rtf"]} for r in ok])
     colors = {ASR_ENGINES[k]["label"]: c for k, c in ASR_COLORS.items()}
-    _show(_bar(frame, "WER", "Word error rate (%) — lower is better", colors, "Model"))
-    _show(_bar(frame, "CER", "Character error rate (%) — lower is better", colors, "Model"))
+    _show(_bar(frame, "Primary", f"{PRIMARY_LABEL[primary]} (%) — lower is better", colors, "Model"))
+    if primary != "cer":
+        _show(_bar(frame, "CER", "Character error rate (%) — lower is better", colors, "Model"))
 
     errors = pd.DataFrame([
         {"Model": r["label"], "Error type": kind, "Count": r[field]}
@@ -1067,7 +1176,7 @@ def render_asr(result):
     st.markdown("#### Word-level alignment against the reference")
     st.caption("Highlighted = substitution (reference in brackets) · strike-through = deleted reference word · underline = inserted word.")
     for r in ok:
-        with st.expander(f"{r['label']} — WER {r['wer']:.1f}%"):
+        with st.expander(f"{r['label']} — {PRIMARY_LABEL[primary]} {r['primary']:.1f}%"):
             st.markdown(_alignment_html(r["alignment"]), unsafe_allow_html=True)
             st.caption("Raw transcript")
             st.text(r["text"])
@@ -1084,6 +1193,8 @@ def render_tts(result):
         if r["status"] == "ok":
             st.markdown(f"**{r['label']}**")
             st.audio(media_data_uri(r["wav"], "audio/wav"), format="audio/wav")
+        elif r["status"] == "unsupported":
+            st.info(f"**{r['label']}** not run — {r['error']}")
         else:
             st.error(f"**{r['label']}** failed — {r['error']}")
     ok = [r for r in rows if r["status"] == "ok"]
@@ -1108,6 +1219,8 @@ def render_tts(result):
             st.warning(f"Loopback for {r['label']} failed — {r['loopback_error']}")
         if r.get("utmos_error"):
             st.warning(f"UTMOS for {r['label']} failed — {r['utmos_error']}")
+
+    render_voice_control(result)
 
     colors = {k: v for k, v in TTS_COLORS.items() if k != INPUT_LABEL}
     frame = pd.DataFrame([{
@@ -1136,6 +1249,52 @@ def render_tts(result):
     _fig_close(fig, "Waveform and log-Mel spectrogram for the input speech and each TTS output")
 
 
+def _voice_key(result, engine_key: str) -> str:
+    return f"heard_voice::{result.get('run_id', result.get('name', 'run'))}::{engine_key}"
+
+
+def heard_voice(result, engine_key: str) -> str:
+    return st.session_state.get(_voice_key(result, engine_key), "not checked")
+
+
+def render_voice_control(result):
+    """Listening confirmation for the thesis voice control. Only engines confirmed as the target
+    voice are ranked; measured F0 is shown as a hint, not as proof of gender."""
+    ok = [r for r in result["tts"] if r["status"] == "ok"]
+    if not ok:
+        return
+    st.markdown(f"#### Voice control — rank only confirmed {TARGET_VOICE} voices")
+    st.caption("Listen to each output and record what you hear. Median F0 is a hint only "
+               "(adult female voices are typically above ~165 Hz), not a gender test.")
+    prosody = result.get("prosody", {})
+    for r in ok:
+        f0 = prosody.get(r["label"], {}).get("metrics", {}).get("F0 median (Hz)", float("nan"))
+        hint = f"median F0 {f0:.0f} Hz" if np.isfinite(f0) else "median F0 unavailable"
+        st.radio(f"{r['label']} — heard voice ({hint})", HEARD_VOICE_OPTIONS, horizontal=True,
+                 key=_voice_key(result, r["key"]))
+    confirmed = [r for r in ok if heard_voice(result, r["key"]) == TARGET_VOICE]
+    if not confirmed:
+        st.info(f"No engine is confirmed as a {TARGET_VOICE} voice yet, so no TTS ranking is shown.")
+        return
+    ranking = pd.DataFrame([{
+        "Model": r["label"],
+        "Loopback WER (%)": r.get("loopback", {}).get("primary", np.nan),
+        "Predicted UTMOS": r.get("utmos") if r.get("utmos") is not None else np.nan,
+        "RTF": r["rtf"],
+    } for r in confirmed]).sort_values(["Loopback WER (%)", "Predicted UTMOS"], ascending=[True, False])
+    st.dataframe(ranking, hide_index=True, width="stretch", column_config={
+        c: st.column_config.NumberColumn(format="%.2f") for c in ranking.columns if c != "Model"
+    })
+    st.caption("Ranked by loopback error (intelligibility proxy), then predicted UTMOS. "
+               "Unconfirmed engines are reported above but not ranked.")
+
+
+def render_synthetic(result):
+    import deepfake
+
+    deepfake.render_scores(result.get("synthetic"))
+
+
 def render_prosody(result):
     prosody = result["prosody"]
     if not prosody:
@@ -1151,12 +1310,16 @@ def render_prosody(result):
 
     if INPUT_LABEL in prosody and len(prosody) > 1:
         comparison = pd.DataFrame({
-            label: compare_prosody(prosody[INPUT_LABEL], analysis) for label, analysis in prosody.items() if label != INPUT_LABEL
+            label: compare_prosody(prosody[INPUT_LABEL], analysis, result.get("tts_truncated", False))
+            for label, analysis in prosody.items() if label != INPUT_LABEL
         })
         comparison.index.name = "Compared with input speech"
         st.markdown("#### How closely each TTS voice follows the input speaker")
         st.dataframe(comparison, width="stretch", column_config={c: st.column_config.NumberColumn(format="%.2f") for c in comparison.columns})
-        st.caption("Correlations compare normalized contour shapes over relative time (1 = same shape). Ratios near 1 and |diff| near 0 mean closer to the input.")
+        st.caption("Correlations compare normalized contour shapes over relative time (1 = same shape). Ratios near 1 and |diff| near 0 mean closer to the input."
+                   + (" Duration ratio is blank because the TTS text was trimmed, so the generated speech covers less content than the input."
+                      if result.get("tts_truncated") else "")
+                   + " This is descriptive resemblance, not word-aligned fidelity or voice cloning.")
 
     order = [label for label in TTS_COLORS if label in prosody]
     scale = alt.Scale(domain=order, range=[TTS_COLORS[l] for l in order])
@@ -1203,7 +1366,7 @@ def _format_engine(engines):
 
 def _clear_research_result() -> None:
     st.session_state.pop("research_result", None)
-    st.session_state.pop("research_result_source_digest", None)
+    st.session_state.pop("research_result_digest", None)
 
 
 def render_research_tab():
@@ -1242,14 +1405,25 @@ def render_research_tab():
         )
     source = recording or upload
     source_bytes = source.getvalue() if source is not None else None
-    source_digest = hashlib.sha256(source_bytes).hexdigest() if source_bytes is not None else None
-    previous_digest = st.session_state.get("research_result_source_digest")
-    if source_digest != previous_digest:
-        st.session_state.pop("research_result", None)
-        st.session_state.pop("research_result_source_digest", None)
+
+    # Suggest the language from the reference text: preset the selector once per new reference,
+    # so the user can still override it afterwards.
+    suggestion, evidence = guess_language(reference_text) if reference_ok else (None, "")
+    reference_key = hashlib.sha256(reference_text.encode("utf-8")).hexdigest() if reference_ok else None
+    if suggestion and st.session_state.get("research_language_ref") != reference_key:
+        st.session_state["research_language"] = suggestion
+        st.session_state["research_language_ref"] = reference_key
 
     with st.container(border=True):
         st.markdown("**Models**")
+        if suggestion:
+            st.caption(f"Suggested from the reference: **{LANGUAGES[suggestion]}** — {evidence}.")
+        language = st.selectbox(
+            "Language variety", list(LANGUAGES), format_func=LANGUAGES.get, key="research_language",
+            help="Routes each model to its language setting and picks the headline metric: "
+                 "normalized WER (Hindi), script-tolerant WER (code-mixed), CER (Sanskrit). "
+                 "Unsupported model-language pairs are reported, not run.",
+        )
         asr = st.multiselect("ASR models", list(ASR_ENGINES), default=["koyal", "sarvam-saaras-v3"],
                              format_func=_format_engine(ASR_ENGINES), key="research_asr")
         tts = st.multiselect("TTS models", list(TTS_ENGINES), default=["bulbul-v3", "mms-tts-hin"],
@@ -1266,12 +1440,28 @@ def render_research_tab():
             format_func=lambda k: "None" if k is None else ASR_ENGINES[k]["label"],
             key="research_judge",
         )
-        columns = st.columns(4)
+        columns = st.columns(5)
         sarvam_mode = columns[0].selectbox("Saaras mode", ["codemix", "transcribe"], key="research_sarvam_mode")
         denoise = columns[1].toggle("Adaptive denoise", value=True, key="research_denoise")
         utmos = columns[2].toggle("UTMOS score", value=True, key="research_utmos", help="Downloads the SpeechMOS UTMOS22 model on first use.")
         release_models = columns[3].toggle("Free models after use", value=True, key="research_release",
-                                           help="Unloads local models after each ASR/TTS step to reduce peak memory. A selected loopback judge may be loaded again later.")
+                                           help="Unloads local models after each ASR/TTS step to reduce peak memory. A selected loopback judge may be loaded again later. Loading time is reported separately from inference.")
+        deepfake_check = columns[4].toggle("Synthetic-speech check", value=False, key="research_deepfake",
+                                           help="Scores the input and every TTS output with the zero-shot Indic detector, plus your own trained detector if one is loaded in Synthetic speech mode.")
+
+        unsupported = [ASR_ENGINES[k]["label"] for k in asr if not engine_support(k, language)[0]]
+        unsupported += [TTS_ENGINES[k]["label"] for k in tts if not engine_support(k, language)[0]]
+        if unsupported:
+            st.info(f"Not run for {LANGUAGES[language]}: {', '.join(unsupported)}.")
+        needs_hf = {"koyal", "indic-conformer-ctc", "indic-conformer-rnnt", "sravaani", "indic-parler-tts"}
+        needs_sarvam = {"sarvam-saaras-v3", "bulbul-v3"}
+        missing = []
+        if needs_hf & set(asr + tts) and missing_secrets(["HF_TOKEN"]):
+            missing.append("HF_TOKEN (gated Hugging Face models)")
+        if needs_sarvam & set(asr + tts) and missing_secrets(["SARVAM_API_KEY"]):
+            missing.append("SARVAM_API_KEY (Sarvam Saaras/Bulbul)")
+        if missing:
+            st.warning("Missing secrets: " + "; ".join(missing) + ". Those models will fail until the secret is added.")
 
         heavy = [ASR_ENGINES[k]["label"] for k in asr if ASR_ENGINES[k]["heavy"]] + [TTS_ENGINES[k]["label"] for k in tts if TTS_ENGINES[k]["heavy"]]
         if heavy:
@@ -1286,18 +1476,28 @@ def render_research_tab():
     elif not reference_ok:
         st.warning("Add the golden-reference transcript to enable scoring.")
 
+    options = {"asr": asr, "tts": tts, "tts_source": tts_source, "judge": judge, "sarvam_mode": sarvam_mode,
+               "denoise": denoise, "utmos": utmos, "release": release_models, "language": language,
+               "deepfake": deepfake_check}
+    # Results belong to one exact combination of audio, reference and settings. Any change
+    # clears them (previously only an audio change did).
+    run_digest = _settings_digest(source_bytes, reference_text, options)
+    if st.session_state.get("research_result_digest") != run_digest:
+        _clear_research_result()
+
     can_run = source is not None and reference_ok and bool(asr)
     if st.button("Run research comparison", type="primary", width="stretch", disabled=not can_run, key="research_run"):
-        st.session_state.pop("research_result", None)
-        st.session_state.pop("research_result_source_digest", None)
+        _clear_research_result()
         try:
-            audio, sr, _ = decode_audio(source_bytes, Path(getattr(source, "name", "recording.wav")).suffix, MAX_RESEARCH_SECONDS)
-            options = {"asr": asr, "tts": tts, "tts_source": tts_source, "judge": judge, "sarvam_mode": sarvam_mode,
-                       "denoise": denoise, "utmos": utmos, "release": release_models}
+            audio, sr, _, info = decode_audio(source_bytes, Path(getattr(source, "name", "recording.wav")).suffix,
+                                              MAX_RESEARCH_SECONDS, return_info=True)
+            run_options = options | {"clipping_fraction": info["clipping_fraction"]}
             with st.status("Running research comparison…", expanded=True) as status:
-                st.session_state["research_result"] = run_research(audio, sr, reference_text, options, status)
-                st.session_state["research_result"]["name"] = getattr(source, "name", "recording")
-                st.session_state["research_result_source_digest"] = source_digest
+                result = run_research(audio, sr, reference_text, run_options, status)
+                result["name"] = getattr(source, "name", "recording")
+                result["run_id"] = run_digest[:12]
+                st.session_state["research_result"] = result
+                st.session_state["research_result_digest"] = run_digest
                 status.update(label="Research comparison complete", state="complete", expanded=False)
         except Exception as exc:
             st.error(f"Research run failed: {type(exc).__name__}: {exc}")
@@ -1307,15 +1507,37 @@ def render_research_tab():
         return
     st.divider()
     st.markdown(f"### Results — {html.escape(str(result['name']))}")
-    sections = st.tabs(["Audio preprocessing", "ASR comparison", "TTS comparison", "Prosody & voice", "Run log"])
-    with sections[0]:
+    render_result_tabs(result)
+
+
+def render_result_tabs(result, log_tab=True):
+    names = ["Audio preprocessing", "ASR comparison", "TTS comparison", "Prosody & voice"]
+    if result.get("synthetic") is not None:
+        names.append("Synthetic speech")
+    if log_tab:
+        names.append("Run log")
+    sections = dict(zip(names, st.tabs(names)))
+    with sections["Audio preprocessing"]:
         render_preprocessing(result)
-    with sections[1]:
+    with sections["ASR comparison"]:
         render_asr(result)
-    with sections[2]:
+    with sections["TTS comparison"]:
         render_tts(result)
-    with sections[3]:
+    with sections["Prosody & voice"]:
         render_prosody(result)
-    with sections[4]:
-        st.dataframe(pd.DataFrame(result["log"]), hide_index=True, width="stretch",
-                     column_config={"Seconds": st.column_config.NumberColumn(format="%.2f")})
+    if "Synthetic speech" in sections:
+        with sections["Synthetic speech"]:
+            render_synthetic(result)
+    if log_tab:
+        with sections["Run log"]:
+            st.dataframe(pd.DataFrame(result["log"]), hide_index=True, width="stretch",
+                         column_config={"Seconds": st.column_config.NumberColumn(format="%.2f")})
+
+
+def _settings_digest(source_bytes, reference_text, options) -> str:
+    import json
+
+    digest = hashlib.sha256(source_bytes or b"")
+    digest.update((reference_text or "").encode("utf-8"))
+    digest.update(json.dumps(options, sort_keys=True, default=str).encode("utf-8"))
+    return digest.hexdigest()

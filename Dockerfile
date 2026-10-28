@@ -27,7 +27,7 @@ RUN mamba create -y -p /opt/mfa -c conda-forge python=3.11 montreal-forced-align
 COPY requirements.txt ./
 RUN /opt/app-env/bin/pip install --no-cache-dir -r requirements.txt
 
-COPY app.py research.py speech_core.py batch_research.py ./
+COPY app.py research.py speech_core.py batch_research.py deepfake.py textnorm.py stats.py ./
 COPY Hindi_Dict_g2g.txt Hindi_All_Acoustic.zip Sanskrit_Dict.txt Sanskrit_Acoustic_Model.zip ./
 COPY .streamlit ./.streamlit
 

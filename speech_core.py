@@ -27,6 +27,93 @@ LIVE_ASR_WINDOW_SECONDS = 28
 WER_PUNCTUATION = re.compile(
     "[" + re.escape("।॥!?,.;:\"'`()[]{}-–—_/\\|<>*&^%$#@+=~") + "]"
 )
+CLIP_LEVEL = 0.999
+ZERO_WIDTH = re.compile("[​‌‍﻿]")
+
+# Language varieties the app understands. "hi-en" = Hindi-English code-mixed speech.
+LANGUAGES = {"hi": "Hindi", "hi-en": "Hindi-English (code-mixed)", "sa": "Sanskrit"}
+# Headline metric per variety, as in the notebook's Section 12B.
+PRIMARY_METRIC = {"hi": "wer", "hi-en": "wer_script_tolerant", "sa": "cer"}
+PRIMARY_LABEL = {"wer": "Normalized WER", "wer_script_tolerant": "Script-tolerant WER", "cer": "Normalized CER"}
+
+
+# ---------------------------------------------------------------- language suggestion from text
+# Common English words as Hindi speakers write them in Devanagari. A suggestion aid only:
+# nativized words (स्कूल, बस, फोन) are common in plain Hindi, so code-mixing needs several of them.
+ENGLISH_IN_DEVANAGARI = set("""
+टीम मीटिंग मैनेजर प्रोजेक्ट डेडलाइन नेक्स्ट लास्ट फ्राइडे मंडे संडे सैटरडे ट्यूज़डे वेडनेसडे थर्सडे वीकेंड वीक मंथ
+प्लान प्लानिंग वाइट व्हाइट ब्लैक बोर्ड व्हाइटबोर्ड टास्क टास्क्स डिवाइड फाइनल रिपोर्ट ईमेल मेल मैसेज कॉल कॉन्फ्रेंस
+ऑफिस बॉस क्लाइंट कस्टमर सर्विस टारगेट सेल्स मार्केटिंग बजट अप्रूवल अप्रूव रिव्यू फीडबैक अपडेट स्टेटस इश्यू प्रॉब्लम
+सॉल्यूशन सॉल्व प्रेजेंटेशन स्लाइड स्लाइड्स डॉक्यूमेंट फाइल फोल्डर शेयर सेंड फॉरवर्ड रिप्लाई चेक कन्फर्म कैंसिल
+पोस्टपोन शेड्यूल टाइम लेट अर्ली सॉरी थैंक्स थैंक्यू प्लीज़ ओके हेलो हाय बाय गुड बेस्ट नाइस ग्रेट कूल सुपर
+सिस्टम सर्वर डेटा डेटाबेस सॉफ्टवेयर हार्डवेयर ऐप एप्लिकेशन वेबसाइट लिंक पासवर्ड लॉगिन अकाउंट नेटवर्क इंटरनेट
+वाईफाई ब्राउज़र डाउनलोड अपलोड इंस्टॉल कोड कोडिंग बग फिक्स टेस्ट टेस्टिंग रिलीज़ वर्ज़न फीचर डिज़ाइन यूज़र
+कंप्यूटर लैपटॉप मोबाइल फोन चार्जर बैटरी स्क्रीन कीबोर्ड प्रिंटर स्कैन ऑनलाइन ऑफलाइन वीडियो ऑडियो फोटो
+मैडम सर डॉक्टर नर्स हॉस्पिटल मेडिकल टिकट स्टेशन ट्रेन बस कैब टैक्सी फ्लाइट एयरपोर्ट होटल बुकिंग रूम
+पार्टी बर्थडे गिफ्ट शॉपिंग मॉल मूवी शो प्रोग्राम मैच गेम टीचर स्टूडेंट क्लास एग्ज़ाम रिज़ल्ट सब्जेक्ट होमवर्क
+कॉलेज यूनिवर्सिटी कोर्स लेक्चर असाइनमेंट सबमिट डेडलाइंस प्रोफेसर लैब रिसर्च पेपर जॉब इंटरव्यू सैलरी
+""".split())
+_HINDI_FUNCTION_WORDS = set("""
+है हैं था थी थे हो होगा होगी का की के में से को और ने पर भी तो कि जो यह वह ये वो नहीं ही तक लिए कर रहा रही रहे
+एक हम मैं आप तुम उस इस उन इन कुछ बहुत क्या कब कहाँ क्यों कैसे अब फिर गया गई गए जा जाता जाती
+""".split())
+_SANSKRIT_ENDINGS = re.compile(r"(?:ः|्|स्य|ानि|ेषु|भ्यः|त्वा|ात्|ाय|न्ति|ति|ते|म्)$")
+
+
+def _deva_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[ऀ-ॿ]+", text or "") if re.search(r"[अ-हक़-ॡ]", w)]
+
+
+def _loanword_key(word: str) -> str:
+    import textnorm
+
+    w = textnorm.fold_nasals(textnorm.fold_nukta(word))
+    for suffix in ("ों", "्स"):
+        if w.endswith(suffix) and len(w) > len(suffix) + 1:
+            w = w[: -len(suffix)]
+    return w
+
+
+_LOANWORD_KEYS = None
+
+
+def guess_language(text: str) -> tuple[str, str]:
+    """Suggest hi / hi-en / sa from a reference transcript, with the evidence used.
+
+    A suggestion for the user to confirm, not language identification:
+      sa    - long words with Sanskrit endings and almost no Hindi function words;
+      hi-en - Latin-script words, or English words written in Devanagari (3+ and 10%+ of words);
+      hi    - otherwise.
+    """
+    global _LOANWORD_KEYS
+    import textnorm
+
+    words = (text or "").split()
+    if not words:
+        return "hi", "no reference text"
+    latin, latin_share = textnorm.latin_share(text)
+    deva = _deva_words(text)
+    if deva:
+        function_rate = sum(w in _HINDI_FUNCTION_WORDS for w in deva) / len(deva)
+        avg_len = sum(len(w) for w in deva) / len(deva)
+        ending_rate = sum(bool(_SANSKRIT_ENDINGS.search(w)) for w in deva) / len(deva)
+        notebook_score = textnorm.sanskrit_likelihood(text)["sanskrit_score"]
+        if len(deva) >= 5 and function_rate < 0.03 and (avg_len >= 6.0 or ending_rate >= 0.4 or notebook_score >= 0.5):
+            return "sa", (f"Sanskrit cues: {function_rate:.0%} Hindi function words, average word "
+                          f"{avg_len:.1f} letters, {ending_rate:.0%} Sanskrit-style endings")
+    if _LOANWORD_KEYS is None:
+        _LOANWORD_KEYS = {_loanword_key(w) for w in ENGLISH_IN_DEVANAGARI}
+    english_deva = [w for w in deva if _loanword_key(w) in _LOANWORD_KEYS]
+    english = latin + len(english_deva)
+    share = english / len(words)
+    unique = list(dict.fromkeys(english_deva))
+    shown = ", ".join(unique[:8]) + (", …" if len(unique) > 8 else "")
+    if english >= 3 and share >= 0.10:
+        detail = f"{english} of {len(words)} words are English"
+        detail += f" (Devanagari: {shown})" if english_deva else " (Latin script)"
+        return "hi-en", detail
+    return "hi", (f"Hindi; {english} English word(s) found, below the code-mix threshold" if english
+                  else "Hindi; no Sanskrit or code-mix cues")
 
 
 class EmptyTranscriptError(RuntimeError):
@@ -57,11 +144,16 @@ def media_data_uri(data: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def dependency_message() -> str | None:
-    for name in ("HF_TOKEN", "SARVAM_API_KEY"):
+def dependency_message(names=("HF_TOKEN", "SARVAM_API_KEY")) -> str | None:
+    """Return a message for the first missing secret among `names` (None when all are set)."""
+    for name in names:
         if not secret(name):
             return f"{name} is missing. Add it to Streamlit secrets or the deployment environment."
     return None
+
+
+def missing_secrets(names) -> list[str]:
+    return [name for name in names if not secret(name)]
 
 
 @st.cache_resource(show_spinner="Loading Koyal Hindi ASR model…")
@@ -74,7 +166,13 @@ def load_koyal():
     return nemo_asr.models.ASRModel.restore_from(checkpoint, map_location="cpu").eval()
 
 
-def decode_audio(raw: bytes, suffix: str, max_seconds: float) -> tuple[np.ndarray, int, float]:
+def decode_audio(raw: bytes, suffix: str, max_seconds: float, return_info: bool = False):
+    """Decode to 16 kHz mono float32 and scale the peak down to 0.95 if louder.
+
+    Returns (audio, sample_rate, duration); with return_info=True also a dict holding
+    measurements taken BEFORE peak scaling (clipping fraction, original peak), because
+    scaling would otherwise hide clipped samples.
+    """
     if not raw:
         raise ValueError("Audio file is empty.")
     if len(raw) > MAX_AUDIO_FILE_BYTES:
@@ -104,9 +202,59 @@ def decode_audio(raw: bytes, suffix: str, max_seconds: float) -> tuple[np.ndarra
     if duration > max_seconds:
         raise ValueError(f"Audio must be ≤{max_seconds:.0f}s; received {duration:.1f}s.")
     peak = float(np.max(np.abs(audio)))
+    info = {
+        "clipping_fraction": float(np.mean(np.abs(audio) >= CLIP_LEVEL)),
+        "input_peak": peak,
+        "peak_scaled": peak > 0.95,
+    }
     if peak:
         audio = np.clip(audio * min(1.0, 0.95 / peak), -1.0, 1.0)
+    if return_info:
+        return audio, sample_rate, duration, info
     return audio, sample_rate, duration
+
+
+# ---------------------------------------------------------------- VAD and ASR windows
+# Moved here from research.py so Live mode can use the same speech-aware windows.
+
+
+@st.cache_resource(show_spinner=False)
+def load_vad():
+    from silero_vad import load_silero_vad
+
+    return load_silero_vad()
+
+
+def run_vad(y: np.ndarray, sr: int) -> list[dict]:
+    from silero_vad import get_speech_timestamps
+
+    stamps = get_speech_timestamps(
+        torch.from_numpy(np.asarray(y, np.float32)),
+        load_vad(),
+        sampling_rate=sr,
+        threshold=0.5,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=150,
+        speech_pad_ms=120,
+    )
+    return [{"start": int(s["start"]), "end": int(s["end"])} for s in stamps]
+
+
+def build_windows(n: int, sr: int, segments: list[dict], max_seconds: float = LIVE_ASR_WINDOW_SECONDS) -> list[tuple[int, int]]:
+    """Windows of at most `max_seconds`, cut at the last VAD speech end at least 2 s in."""
+    max_len = int(max_seconds * sr)
+    vad_ends = sorted({min(n, s["end"]) for s in segments if 0 < s["end"] <= n})
+    windows, start = [], 0
+    while start < n:
+        hard_end = min(n, start + max_len)
+        if hard_end >= n:
+            end = n
+        else:
+            legal = [b for b in vad_ends if start + 2 * sr <= b <= hard_end]
+            end = max(legal) if legal else hard_end
+        windows.append((start, end))
+        start = end
+    return windows
 
 
 def _hypothesis_text(value) -> str:
@@ -133,15 +281,24 @@ def nemo_transcribe_segments(model, segments: list[np.ndarray], sample_rate: int
             Path(path).unlink(missing_ok=True)
 
 
+def speech_windows(audio: np.ndarray, sample_rate: int) -> list[tuple[int, int]]:
+    """VAD-aware windows; falls back to fixed 28 s cuts if VAD is unavailable."""
+    if len(audio) <= LIVE_ASR_WINDOW_SECONDS * sample_rate:
+        return [(0, len(audio))]
+    try:
+        segments = run_vad(audio, sample_rate)
+    except Exception:
+        segments = []
+    return build_windows(len(audio), sample_rate, segments)
+
+
 def transcribe(audio: np.ndarray, sample_rate: int) -> tuple[str, float]:
+    """Koyal transcript and inference seconds (model download/loading excluded)."""
+    model = load_koyal()
+    windows = speech_windows(audio, sample_rate)
+    segments = [np.ascontiguousarray(audio[start:end], dtype=np.float32) for start, end in windows]
     started = time.perf_counter()
-    window_samples = LIVE_ASR_WINDOW_SECONDS * sample_rate
-    segments = (
-        [audio[start:start + window_samples] for start in range(0, len(audio), window_samples)]
-        if len(audio) > window_samples
-        else [audio]
-    )
-    text = " ".join(nemo_transcribe_segments(load_koyal(), segments, sample_rate)).strip()
+    text = " ".join(nemo_transcribe_segments(model, segments, sample_rate)).strip()
     elapsed = time.perf_counter() - started
     if not text:
         raise EmptyTranscriptError(audio, sample_rate)
@@ -315,20 +472,47 @@ def align_words(reference: list[str], hypothesis: list[str]) -> list[tuple[str, 
     return ops[::-1]
 
 
-def score_transcript(reference_text: str, transcript: str) -> dict:
-    reference = normalize_reference_text(reference_text)
-    hypothesis = normalize_reference_text(transcript)
+def score_transcript(reference_text: str, transcript: str, language: str = "hi") -> dict:
+    """WER/CER under the notebook's scoring protocol (textnorm.score_all), in percent.
+
+    wer / cer          normalized: numbers to words, nukta and nasal folding, acronyms, loanwords
+    wer_raw / cer_raw  NFC + lowercase + punctuation removed only
+    wer_script_tolerant  normalized, with cross-script words matched by phonetic key
+    primary            the headline metric for the language (hi: wer, hi-en: script-tolerant, sa: cer)
+    Error and denominator counts are returned so batches can pool corpus WER/CER with CIs.
+    """
+    import textnorm
+
+    norm_language = "hi" if language in ("hi", "hi-en") else language
+    reference_text = ZERO_WIDTH.sub("", reference_text or "")
+    transcript = ZERO_WIDTH.sub("", transcript or "")
+    if not normalize_reference_text(reference_text):
+        raise ValueError("The reference transcript is empty after normalization.")
+    scores = textnorm.score_all(reference_text, transcript, norm_language)
+    reference = textnorm.normalize_text(reference_text, norm_language)
+    hypothesis = textnorm.normalize_text(transcript, norm_language)
     if not reference:
         raise ValueError("The reference transcript is empty after normalization.")
-    ref_words, hyp_words = reference.split(), hypothesis.split()
-    ops = align_words(ref_words, hyp_words)
-    ref_chars, hyp_chars = reference.replace(" ", ""), hypothesis.replace(" ", "")
-    return {
-        "wer": edit_distance(ref_words, hyp_words) / len(ref_words) * 100,
-        "cer": edit_distance(ref_chars, hyp_chars) / len(ref_chars) * 100,
+    ops = align_words(reference.split(), hypothesis.split())
+    result = {
+        "wer": scores["wer_norm"] * 100,
+        "cer": scores["cer_norm"] * 100,
+        "wer_raw": scores["wer_raw"] * 100,
+        "cer_raw": scores["cer_raw"] * 100,
+        "wer_script_tolerant": scores["wer_script_tolerant"] * 100,
+        "cross_script_matches": scores["cross_script_matches"],
         "substitutions": sum(op == "sub" for op, _, _ in ops),
         "deletions": sum(op == "del" for op, _, _ in ops),
         "insertions": sum(op == "ins" for op, _, _ in ops),
-        "reference_words": len(ref_words),
+        "reference_words": len(reference.split()),
+        "errors_norm": scores["errors_norm"],
+        "errors_script_tolerant": scores["errors_script_tolerant"],
+        "reference_words_norm": scores["reference_words_norm"],
+        "char_errors_norm": scores["char_errors_norm"],
+        "reference_chars_norm": scores["reference_chars_norm"],
+        "language": language,
+        "primary_metric": PRIMARY_METRIC.get(language, "wer"),
         "alignment": ops,
     }
+    result["primary"] = result[result["primary_metric"]]
+    return result
