@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import altair as alt
 import librosa
@@ -28,6 +29,7 @@ from speech_core import (
     LANGUAGES,
     PRIMARY_LABEL,
     SAMPLE_RATE,
+    audio_quality_preview,
     build_windows,
     decode_audio,
     guess_language,
@@ -107,9 +109,15 @@ ASR_ENGINES = {
 }
 TTS_ENGINES = {
     "bulbul-v3": {"label": "Sarvam Bulbul v3", "memory": "API", "heavy": False},
+    "maya2-native": {"label": "Maya 2 Native (remote API)", "memory": "API", "heavy": False},
     "mms-tts-hin": {"label": "Meta MMS-TTS Hindi", "memory": "~0.15 GB", "heavy": False},
     "indic-parler-tts": {"label": "Indic Parler-TTS", "memory": "~3.5 GB", "heavy": True},
 }
+MAYA_VOICES = [
+    "Ahana", "Vaidehi", "Malini", "Charvi", "Jahnavi", "Anirban", "Nakul", "Vasant",
+    "Siddhant", "Satvik", "Abhay", "Nivedita", "Ishwari", "Ritvik", "Vrinda", "Sreekar",
+    "Kayal", "Shaunak", "Akshat", "Tanushree",
+]
 ASR_COLORS = {key: PALETTE[index] for index, key in enumerate(ASR_ENGINES)}
 
 # Which engine may run on which variety. (supported, note shown in the results).
@@ -130,6 +138,8 @@ _SUPPORT = {
     "sravaani": {"hi": (True, ""), "hi-en": (True, ""), "sa": (True, "")},
     "bulbul-v3": {"hi": (True, ""), "hi-en": (True, ""),
                   "sa": (False, "No configured Sanskrit support in Bulbul v3.")},
+    "maya2-native": {"hi": (True, ""), "hi-en": (True, "Maya receives Hindi as the synthesis language; review code-mixed pronunciation."),
+                     "sa": (False, "Maya 2 Native does not list Sanskrit among its supported languages.")},
     "mms-tts-hin": {"hi": (True, ""),
                     "hi-en": (True, "Latin-script words may be mispronounced (model limitation)."),
                     "sa": (False, "No validated Sanskrit MMS checkpoint configured.")},
@@ -149,22 +159,26 @@ TTS_COLORS = {INPUT_LABEL: REFERENCE_COLOR} | {
 # ---------------------------------------------------------------- model loaders
 
 
+def _inference_device(use_gpu: bool = True) -> torch.device:
+    return torch.device("cuda:0" if use_gpu and torch.cuda.is_available() else "cpu")
+
+
 @st.cache_resource(show_spinner=False)
-def load_whisper():
+def load_whisper(device: str = "cpu"):
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         WHISPER_MODEL_ID,
         revision=WHISPER_REVISION,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
         low_cpu_mem_usage=True,
         use_safetensors=True,
-    ).eval()
+    ).to(device).eval()
     return model, AutoProcessor.from_pretrained(WHISPER_MODEL_ID, revision=WHISPER_REVISION)
 
 
 @st.cache_resource(show_spinner=False)
-def load_indic_conformer():
+def load_indic_conformer(device: str = "cpu"):
     from transformers import AutoModel
 
     return AutoModel.from_pretrained(
@@ -172,7 +186,7 @@ def load_indic_conformer():
         revision=INDIC_CONFORMER_REVISION,
         trust_remote_code=True,
         token=secret("HF_TOKEN") or None,
-    )
+    ).to(device).eval()
 
 
 def _process_rss_mb() -> str:
@@ -236,7 +250,7 @@ def _trim_process_heap() -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def load_sravaani():
+def load_sravaani(device: str = "cpu"):
     from transformers import AutoModel
 
     logger.info(
@@ -252,7 +266,7 @@ def load_sravaani():
             revision=SRAVAANI_MODEL_REVISION,
             trust_remote_code=True,
             token=secret("HF_TOKEN") or None,
-        ).eval()
+        ).to(device).eval()
     except Exception:
         logger.exception("SraVaani model load failed")
         raise
@@ -268,18 +282,18 @@ def load_sravaani():
 
 
 @st.cache_resource(show_spinner=False)
-def load_mms():
+def load_mms(device: str = "cpu"):
     from transformers import VitsModel, VitsTokenizer
 
     model = VitsModel.from_pretrained(
         MMS_MODEL_ID, revision=MMS_REVISION, torch_dtype=torch.float32
-    ).eval()
+    ).to(device).eval()
     tokenizer = VitsTokenizer.from_pretrained(MMS_MODEL_ID, revision=MMS_REVISION)
     return model, tokenizer
 
 
 @st.cache_resource(show_spinner=False)
-def load_parler():
+def load_parler(device: str = "cpu"):
     try:
         from parler_tts import ParlerTTSForConditionalGeneration
     except ImportError as exc:
@@ -293,7 +307,7 @@ def load_parler():
     token = secret("HF_TOKEN") or None
     model = ParlerTTSForConditionalGeneration.from_pretrained(
         PARLER_MODEL_ID, revision=PARLER_REVISION, token=token
-    ).eval()
+    ).to(device).eval()
     prompt_tokenizer = AutoTokenizer.from_pretrained(
         PARLER_MODEL_ID, revision=PARLER_REVISION, token=token
     )
@@ -311,8 +325,8 @@ def load_parler():
 
 
 @st.cache_resource(show_spinner=False)
-def load_utmos():
-    return torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).eval()
+def load_utmos(device: str = "cpu"):
+    return torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to(device).eval()
 
 
 RELEASERS = {
@@ -465,7 +479,8 @@ def _text_from(value) -> str:
 
 
 def asr_koyal(y, sr, windows, options):
-    return " ".join(nemo_transcribe_segments(load_koyal(), _segments(y, windows), sr))
+    device = str(_inference_device(options.get("use_gpu", True)))
+    return " ".join(nemo_transcribe_segments(load_koyal(device), _segments(y, windows), sr))
 
 
 def asr_sarvam(y, sr, windows, options):
@@ -493,7 +508,8 @@ def asr_sarvam(y, sr, windows, options):
 
 
 def asr_whisper(y, sr, windows, options):
-    model, processor = load_whisper()
+    device = str(_inference_device(options.get("use_gpu", True)))
+    model, processor = load_whisper(device)
     language = options.get("language", "hi")
     # Code-mixed speech: let Whisper pick the language per window instead of forcing Hindi.
     generate_args = {"task": "transcribe", "max_new_tokens": 384}
@@ -501,7 +517,9 @@ def asr_whisper(y, sr, windows, options):
         generate_args["language"] = language
     texts = []
     for segment in _segments(y, windows):
-        features = processor(segment, sampling_rate=sr, return_tensors="pt").input_features
+        features = processor(segment, sampling_rate=sr, return_tensors="pt").input_features.to(
+            device=device, dtype=model.dtype
+        )
         with torch.inference_mode():
             tokens = model.generate(features, **generate_args)
         texts.append(processor.batch_decode(tokens, skip_special_tokens=True)[0].strip())
@@ -510,20 +528,23 @@ def asr_whisper(y, sr, windows, options):
 
 def _asr_indic_conformer(decoder):
     def run(y, sr, windows, options):
-        model = load_indic_conformer()
+        device = str(_inference_device(options.get("use_gpu", True)))
+        model = load_indic_conformer(device)
         language = "sa" if options.get("language") == "sa" else "hi"
         texts = []
         with torch.inference_mode():
             for segment in _segments(y, windows):
-                texts.append(_text_from(model(torch.from_numpy(segment).unsqueeze(0), language, decoder)))
+                inputs = torch.from_numpy(segment).unsqueeze(0).to(device)
+                texts.append(_text_from(model(inputs, language, decoder)))
         return " ".join(texts)
 
     return run
 
 
 def asr_sravaani(y, sr, windows, options):
-    model = load_sravaani()
-    available_mb = _container_memory_available_mb()
+    device = str(_inference_device(options.get("use_gpu", True)))
+    model = load_sravaani(device)
+    available_mb = None if device.startswith("cuda") else _container_memory_available_mb()
     if available_mb is not None and available_mb < SRAVAANI_MIN_INFERENCE_HEADROOM_MB:
         message = (
             f"SraVaani loaded, but inference was not started: only {available_mb} MB of container "
@@ -619,8 +640,55 @@ def tts_bulbul(text, language="hi"):
     return np.asarray(audio, np.float32), int(sr), elapsed
 
 
-def tts_mms(text, language="hi"):
-    model, tokenizer = load_mms()
+def tts_maya(text, language="hi", voice="Ahana"):
+    """Call a Maya 2 Native OpenAI-compatible speech endpoint configured by the Space owner."""
+    base_url = secret("MAYA_API_BASE_URL").rstrip("/")
+    if not base_url:
+        raise RuntimeError("Set MAYA_API_BASE_URL in the Hugging Face Space secrets to enable Maya.")
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+    ):
+        raise RuntimeError("MAYA_API_BASE_URL must use HTTPS (HTTP is allowed only for localhost).")
+    if not parsed.hostname or parsed.query or parsed.fragment:
+        raise RuntimeError("MAYA_API_BASE_URL must be a server URL without query parameters or fragments.")
+    if parsed.path.rstrip("/").endswith("/v1/audio/speech"):
+        endpoint = base_url.rstrip("/")
+    elif parsed.path.rstrip("/").endswith("/v1"):
+        endpoint = f"{base_url.rstrip('/')}/audio/speech"
+    else:
+        endpoint = f"{base_url}/v1/audio/speech"
+    headers = {}
+    api_key = secret("MAYA_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "input": text,
+        "language": "hi" if language in {"hi", "hi-en"} else language,
+        "voice": voice,
+        "response_format": "flac",
+        "normalize": True,
+    }
+    started = time.perf_counter()
+    try:
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=(10, 180))
+    except requests.RequestException as exc:
+        raise RuntimeError("Network error calling the configured Maya speech API.") from exc
+    if response.status_code in {401, 403}:
+        raise RuntimeError("Maya speech API authorization failed; check MAYA_API_KEY.")
+    if response.status_code != 200:
+        raise RuntimeError(f"Maya speech API returned HTTP {response.status_code}.")
+    try:
+        audio, sr = sf.read(io.BytesIO(response.content), dtype="float32", always_2d=False)
+    except Exception as exc:
+        raise RuntimeError("Maya API response was not a readable WAV file.") from exc
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    return np.asarray(audio, np.float32), int(sr), time.perf_counter() - started
+
+
+def tts_mms(text, language="hi", device="cpu"):
+    model, tokenizer = load_mms(device)
     if getattr(tokenizer, "is_uroman", False):
         raise RuntimeError("This MMS checkpoint needs uroman romanization, which is not installed.")
     sr = int(model.config.sampling_rate)
@@ -633,18 +701,20 @@ def tts_mms(text, language="hi"):
             inputs = tokenizer(chunk, return_tensors="pt")
             if inputs["input_ids"].shape[-1] == 0:
                 continue
+            inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
             parts += [model(**inputs).waveform[0].float().cpu().numpy(), silence]
     if not parts:
         raise RuntimeError("MMS-TTS produced no audio for this text.")
     return np.concatenate(parts[:-1]).astype(np.float32), sr, time.perf_counter() - started
 
 
-def tts_parler(text, language="hi"):
+def tts_parler(text, language="hi", device="cpu"):
     """Sentence-chunked Parler synthesis. One 2048-token generate call holds only ~24 s of
     audio, so long texts were silently cut off; chunks of <=180 characters avoid that."""
-    model, prompt_tokenizer, description_tokenizer = load_parler()
+    model, prompt_tokenizer, description_tokenizer = load_parler(device)
     description_text = PARLER_DESCRIPTION_SA if language == "sa" else PARLER_DESCRIPTION
     description = description_tokenizer(description_text, return_tensors="pt")
+    description = {name: tensor.to(device) for name, tensor in description.items()}
     sr = int(model.config.sampling_rate)
     silence = np.zeros(int(0.18 * sr), dtype=np.float32)
     parts = []
@@ -653,6 +723,7 @@ def tts_parler(text, language="hi"):
         for chunk in sentence_chunks(text, PARLER_CHUNK_CHARS):
             torch.manual_seed(TTS_SEED)
             prompt = prompt_tokenizer(chunk, return_tensors="pt")
+            prompt = {name: tensor.to(device) for name, tensor in prompt.items()}
             audio = model.generate(
                 input_ids=description.input_ids,
                 attention_mask=description.attention_mask,
@@ -670,8 +741,8 @@ def tts_parler(text, language="hi"):
 TTS_RUNNERS = {"bulbul-v3": tts_bulbul, "mms-tts-hin": tts_mms, "indic-parler-tts": tts_parler}
 
 
-def predicted_utmos(audio: np.ndarray, sr: int) -> float:
-    model = load_utmos()
+def predicted_utmos(audio: np.ndarray, sr: int, device: str = "cpu") -> float:
+    model = load_utmos(device)
     a = librosa.resample(audio, orig_sr=sr, target_sr=16000) if sr != 16000 else audio
     a = np.ascontiguousarray(a, dtype=np.float32)
     window, scores, weights = 10 * 16000, [], []
@@ -681,7 +752,7 @@ def predicted_utmos(audio: np.ndarray, sr: int) -> float:
             samples = len(chunk)
             if samples < 16000:
                 chunk = np.pad(chunk, (0, 16000 - samples))
-            scores.append(float(model(torch.from_numpy(chunk).unsqueeze(0), 16000)))
+            scores.append(float(model(torch.from_numpy(chunk).unsqueeze(0).to(device), 16000)))
             weights.append(samples)
     return float(np.average(scores, weights=weights))
 
@@ -845,6 +916,10 @@ def _wav_bytes(audio: np.ndarray, sr: int) -> bytes:
 
 def run_research(audio, sr, reference_text, options, status) -> dict:
     log = []
+    device = str(_inference_device(options.get("use_gpu", True)))
+    options = options | {"device": device}
+    status.write(f"Local model inference device: {device}. Audio preprocessing and scoring remain on CPU.")
+    log.append({"Step": "Compute device", "Status": "ok", "Seconds": 0.0, "Detail": device})
 
     def step(name, fn, *args):
         status.write(f"{name}…")
@@ -894,7 +969,7 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
         if loader is None:
             return 0.0, None
         started = time.perf_counter()
-        _, error = step(f"Load · {label}", loader)
+        _, error = step(f"Load · {label}", loader, device)
         return time.perf_counter() - started, error
 
     asr_rows = []
@@ -926,7 +1001,10 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
             release_unless_needed(key, options["asr"][index + 1:] + ([judge] if judge else []))
 
     tts_text, source = reference_text, "Reference transcript"
-    if options["tts_source"] != "reference":
+    if options["tts_source"] == "custom":
+        tts_text = str(options.get("custom_tts_text", "")).strip()
+        source = "Reviewed custom text"
+    elif options["tts_source"] != "reference":
         source_row = next((r for r in asr_rows if r["key"] == options["tts_source"] and r["status"] == "ok"), None)
         if source_row:
             tts_text, source = source_row["text"], f"{source_row['label']} transcript"
@@ -946,9 +1024,22 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
         load_seconds, error = load_model(key, label)
         result = None
         if not error:
-            result, error = step(f"TTS · {label}", TTS_RUNNERS[key], tts_text, language)
+            if key == "maya2-native":
+                result, error = step(
+                    f"TTS · {label}",
+                    tts_maya,
+                    tts_text,
+                    language,
+                    options.get("maya_voice", "Ahana"),
+                )
+            elif key in {"mms-tts-hin", "indic-parler-tts"}:
+                result, error = step(f"TTS · {label}", TTS_RUNNERS[key], tts_text, language, device)
+            else:
+                result, error = step(f"TTS · {label}", TTS_RUNNERS[key], tts_text, language)
         row = {"key": key, "label": label, "note": note, "load_seconds": load_seconds,
                "status": "failed" if error else "ok", "error": error}
+        if key == "maya2-native":
+            row["voice"] = options.get("maya_voice", "Ahana")
         if result:
             out, out_sr, elapsed = result
             out_duration = len(out) / out_sr
@@ -977,7 +1068,9 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
             if text:
                 row["loopback"] = score_transcript(tts_text, text, language)
         if options["utmos"]:
-            row["utmos"], row["utmos_error"] = step(f"UTMOS · {row['label']}", predicted_utmos, row["audio"], row["sr"])
+            row["utmos"], row["utmos_error"] = step(
+                f"UTMOS · {row['label']}", predicted_utmos, row["audio"], row["sr"], device
+            )
     if judge and options["release"]:
         release(judge)
     if options["utmos"]:
@@ -1191,7 +1284,8 @@ def render_tts(result):
     st.caption("Original input speech")
     for r in rows:
         if r["status"] == "ok":
-            st.markdown(f"**{r['label']}**")
+            model_label = f"{r['label']} · {r['voice']}" if r.get("voice") else r["label"]
+            st.markdown(f"**{model_label}**")
             st.audio(media_data_uri(r["wav"], "audio/wav"), format="audio/wav")
         elif r["status"] == "unsupported":
             st.info(f"**{r['label']}** not run — {r['error']}")
@@ -1202,7 +1296,8 @@ def render_tts(result):
         return
     judge = result["judge"]
     table = pd.DataFrame([{
-        "Model": r["label"], "Duration (s)": r["duration"], "Latency (s)": r["latency"], "RTF": r["rtf"],
+        "Model": f"{r['label']} · {r['voice']}" if r.get("voice") else r["label"],
+        "Duration (s)": r["duration"], "Latency (s)": r["latency"], "RTF": r["rtf"],
         "Loopback WER (%)": r.get("loopback", {}).get("wer"), "Loopback CER (%)": r.get("loopback", {}).get("cer"),
         "Predicted UTMOS": r.get("utmos"),
     } for r in ok])
@@ -1405,6 +1500,24 @@ def render_research_tab():
         )
     source = recording or upload
     source_bytes = source.getvalue() if source is not None else None
+    audio_quality = None
+    if source_bytes is not None:
+        try:
+            audio_quality = audio_quality_preview(
+                source_bytes,
+                Path(getattr(source, "name", "recording.wav")).suffix,
+                MAX_RESEARCH_SECONDS,
+            )
+            st.caption(
+                f"Audio check · {audio_quality['duration']:.1f} s · "
+                f"peak {audio_quality['peak']:.3f} · RMS {audio_quality['rms_dbfs']:.1f} dBFS"
+            )
+            if audio_quality["rms_dbfs"] < -35:
+                st.warning("The recording is very quiet; try a closer microphone position before analysis.")
+            if audio_quality["clipping_fraction"] >= 0.005:
+                st.warning("The recording may be clipped; reduce the input level before analysis.")
+        except Exception as exc:
+            st.error(f"Could not inspect the recording: {type(exc).__name__}: {exc}")
 
     # Suggest the language from the reference text: preset the selector once per new reference,
     # so the user can still override it afterwards.
@@ -1426,12 +1539,28 @@ def render_research_tab():
         )
         asr = st.multiselect("ASR models", list(ASR_ENGINES), default=["koyal", "sarvam-saaras-v3"],
                              format_func=_format_engine(ASR_ENGINES), key="research_asr")
-        tts = st.multiselect("TTS models", list(TTS_ENGINES), default=["bulbul-v3", "mms-tts-hin"],
+        default_tts = ["bulbul-v3", "mms-tts-hin"]
+        if secret("MAYA_API_BASE_URL"):
+            default_tts.append("maya2-native")
+        tts = st.multiselect("TTS models", list(TTS_ENGINES), default=default_tts,
                              format_func=_format_engine(TTS_ENGINES), key="research_tts")
+        if "maya2-native" in tts:
+            maya_voice = st.selectbox("Maya voice", MAYA_VOICES, key="research_maya_voice")
+            maya_base_url = secret("MAYA_API_BASE_URL")
+            if maya_base_url:
+                st.caption("Maya uses the configured remote endpoint; it must support POST /v1/audio/speech. Audio and text are sent to that provider.")
+            else:
+                st.warning("Set MAYA_API_BASE_URL in Hugging Face Space secrets to use Maya 2 Native.")
+        else:
+            maya_voice = "Ahana"
         columns = st.columns(2)
         tts_source = columns[0].selectbox(
-            "Text for TTS", ["reference", *asr],
-            format_func=lambda k: "Reference transcript" if k == "reference" else f"{ASR_ENGINES[k]['label']} transcript",
+            "Text for TTS", ["reference", "custom", *asr],
+            format_func=lambda k: (
+                "Reference transcript" if k == "reference"
+                else "Reviewed custom text" if k == "custom"
+                else f"{ASR_ENGINES[k]['label']} transcript"
+            ),
             key="research_tts_source",
         )
         judge = columns[1].selectbox(
@@ -1440,7 +1569,8 @@ def render_research_tab():
             format_func=lambda k: "None" if k is None else ASR_ENGINES[k]["label"],
             key="research_judge",
         )
-        columns = st.columns(5)
+        gpu_available = torch.cuda.is_available()
+        columns = st.columns(6)
         sarvam_mode = columns[0].selectbox("Saaras mode", ["codemix", "transcribe"], key="research_sarvam_mode")
         denoise = columns[1].toggle("Adaptive denoise", value=True, key="research_denoise")
         utmos = columns[2].toggle("UTMOS score", value=True, key="research_utmos", help="Downloads the SpeechMOS UTMOS22 model on first use.")
@@ -1448,6 +1578,31 @@ def render_research_tab():
                                            help="Unloads local models after each ASR/TTS step to reduce peak memory. A selected loopback judge may be loaded again later. Loading time is reported separately from inference.")
         deepfake_check = columns[4].toggle("Synthetic-speech check", value=False, key="research_deepfake",
                                            help="Scores the input and every TTS output with the zero-shot Indic detector, plus your own trained detector if one is loaded in Synthetic speech mode.")
+        use_gpu = columns[5].toggle(
+            "Use GPU for local models",
+            value=gpu_available,
+            disabled=not gpu_available,
+            key="research_use_gpu",
+            help="Run supported local ASR/TTS models and UTMOS on CUDA. CPU preprocessing and scoring remain unchanged.",
+        )
+        if gpu_available and use_gpu:
+            gpu = torch.cuda.get_device_properties(0)
+            st.caption(f"CUDA enabled · {torch.cuda.get_device_name(0)} · {gpu.total_memory / 1024**3:.1f} GB VRAM")
+        elif gpu_available:
+            st.caption("Local models will run on CPU; CUDA is available but disabled.")
+        else:
+            st.info("CUDA GPU not detected. Local models will use CPU. Enable GPU hardware and install a CUDA-enabled PyTorch build to use acceleration.")
+
+        if tts_source == "custom":
+            custom_tts_text = st.text_area(
+                "Review or edit text for TTS",
+                value=reference_text,
+                height=100,
+                key=f"research_custom_tts_{reference_key or 'empty'}",
+                help="This text is sent to every selected TTS model instead of the reference or an ASR result.",
+            ).strip()
+        else:
+            custom_tts_text = ""
 
         unsupported = [ASR_ENGINES[k]["label"] for k in asr if not engine_support(k, language)[0]]
         unsupported += [TTS_ENGINES[k]["label"] for k in tts if not engine_support(k, language)[0]]
@@ -1460,15 +1615,18 @@ def render_research_tab():
             missing.append("HF_TOKEN (gated Hugging Face models)")
         if needs_sarvam & set(asr + tts) and missing_secrets(["SARVAM_API_KEY"]):
             missing.append("SARVAM_API_KEY (Sarvam Saaras/Bulbul)")
+        if "maya2-native" in tts and missing_secrets(["MAYA_API_BASE_URL"]):
+            missing.append("MAYA_API_BASE_URL (Maya-compatible remote speech endpoint)")
         if missing:
             st.warning("Missing secrets: " + "; ".join(missing) + ". Those models will fail until the secret is added.")
 
         heavy = [ASR_ENGINES[k]["label"] for k in asr if ASR_ENGINES[k]["heavy"]] + [TTS_ENGINES[k]["label"] for k in tts if TTS_ENGINES[k]["heavy"]]
         if heavy:
+            device_label = "GPU" if gpu_available and use_gpu else "CPU"
             st.warning(
-                f"{', '.join(heavy)} run locally on the Space's CPU. Expect several minutes per model "
-                "and first-run downloads of several GB. Check the memory estimates shown beside each "
-                "model against your Space hardware; deselect models if you run out of memory."
+                f"{', '.join(heavy)} run locally on the {device_label}. Expect first-run downloads of several GB. "
+                "Check the memory estimates shown beside each model against available RAM/VRAM; deselect "
+                "models if you run out of memory."
             )
 
     if source is None:
@@ -1476,16 +1634,23 @@ def render_research_tab():
     elif not reference_ok:
         st.warning("Add the golden-reference transcript to enable scoring.")
 
-    options = {"asr": asr, "tts": tts, "tts_source": tts_source, "judge": judge, "sarvam_mode": sarvam_mode,
+    options = {"asr": asr, "tts": tts, "tts_source": tts_source, "custom_tts_text": custom_tts_text,
+               "maya_voice": maya_voice, "judge": judge, "sarvam_mode": sarvam_mode,
                "denoise": denoise, "utmos": utmos, "release": release_models, "language": language,
-               "deepfake": deepfake_check}
+               "deepfake": deepfake_check, "use_gpu": use_gpu}
     # Results belong to one exact combination of audio, reference and settings. Any change
     # clears them (previously only an audio change did).
     run_digest = _settings_digest(source_bytes, reference_text, options)
     if st.session_state.get("research_result_digest") != run_digest:
         _clear_research_result()
 
-    can_run = source is not None and reference_ok and bool(asr)
+    can_run = (
+        source is not None
+        and audio_quality is not None
+        and reference_ok
+        and bool(asr)
+        and (tts_source != "custom" or bool(normalize_reference_text(custom_tts_text)))
+    )
     if st.button("Run research comparison", type="primary", width="stretch", disabled=not can_run, key="research_run"):
         _clear_research_result()
         try:

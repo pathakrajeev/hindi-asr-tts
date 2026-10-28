@@ -32,9 +32,11 @@ from deepfake import render_synthetic_mode  # noqa: E402
 from speech_core import (
     EmptyTranscriptError,
     LIVE_ASR_WINDOW_SECONDS,
+    audio_quality_preview,
     decode_audio,
     dependency_message,
     media_data_uri,
+    normalize_reference_text,
     synthesize_in_chunks,
     transcribe,
 )  # noqa: E402
@@ -184,13 +186,14 @@ def render_metrics_dashboard(
 
 def render_live_tab() -> None:
     st.subheader("Live mode")
-    st.info("Record or upload Hindi speech, then transcribe with Koyal and speak it back with Bulbul.")
+    st.info("Record or upload Hindi speech, review and correct Koyal's transcript, then generate speech from the corrected text.")
     left, right = st.columns(2)
     with left:
         recording = st.audio_input("Record Hindi speech", key="live_recording")
     with right:
         upload = st.file_uploader("Or upload audio", type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"], key="live_upload")
     source = recording or upload
+    quality = None
     if source is None:
         st.info("🎤 Record or upload Hindi audio up to 25 minutes (maximum file size: 50 MB).")
     else:
@@ -198,15 +201,28 @@ def render_live_tab() -> None:
         source_name = getattr(source, "name", "recording.wav")
         size_mb = len(raw) / (1024 * 1024)
         st.caption(f"Selected: {source_name} · {size_mb:.1f} MB")
+        try:
+            quality = audio_quality_preview(raw, Path(source_name).suffix, MAX_AUDIO_SECONDS)
+            st.caption(
+                f"Audio check · {quality['duration']:.1f} s · "
+                f"peak {quality['peak']:.3f} · RMS {quality['rms_dbfs']:.1f} dBFS"
+            )
+            if quality["rms_dbfs"] < -35:
+                st.warning("This recording is very quiet; try speaking closer to the microphone before transcription.")
+            if quality["clipping_fraction"] >= 0.005:
+                st.warning("This recording may be clipped; reduce the microphone input level before transcription.")
+        except Exception as exc:
+            st.error(f"Could not inspect the recording: {type(exc).__name__}: {exc}")
     source_digest = hashlib.sha256(source.getvalue()).hexdigest() if source is not None else None
     stored = st.session_state.get("live_result")
     if stored is not None and stored["digest"] != source_digest:
         st.session_state.pop("live_result", None)  # new or removed audio: old result no longer applies
         stored = None
     if st.button(
-        "Transcribe and speak",
+        "Transcribe audio",
         type="primary",
         width="stretch",
+        disabled=source is None or quality is None,
         key="live_process",
     ):
         if source is None:
@@ -221,8 +237,9 @@ def _process_live(source, source_digest):
     raw = source.getvalue()
     try:
         with st.status("Processing live audio…", expanded=True) as status:
-            audio, sample_rate, input_seconds = decode_audio(
-                raw, Path(getattr(source, "name", "recording.wav")).suffix, MAX_AUDIO_SECONDS
+            audio, sample_rate, input_seconds, audio_info = decode_audio(
+                raw, Path(getattr(source, "name", "recording.wav")).suffix, MAX_AUDIO_SECONDS,
+                return_info=True,
             )
             if input_seconds > LIVE_ASR_WINDOW_SECONDS:
                 st.write(
@@ -232,18 +249,10 @@ def _process_live(source, source_digest):
             else:
                 st.write("Transcribing with Koyal…")
             transcript, asr_seconds = transcribe(audio, sample_rate)
-            st.write("Generating speech with Bulbul…")
-            generated_wav, tts_seconds, generated_seconds, tts_chunks = synthesize_in_chunks(
-                transcript,
-                on_chunk=lambda index, total: status.write(
-                    f"Generating speech chunk {index} of {total}…"
-                ),
-            )
-            status.update(label="Complete", state="complete", expanded=False)
+            status.update(label="Transcription complete", state="complete", expanded=False)
         result = {
             "digest": source_digest, "audio": audio, "sample_rate": sample_rate, "input_seconds": input_seconds,
-            "transcript": transcript, "asr_seconds": asr_seconds, "generated_wav": generated_wav,
-            "tts_seconds": tts_seconds, "generated_seconds": generated_seconds, "tts_chunks": tts_chunks,
+            "audio_info": audio_info, "transcript": transcript, "asr_seconds": asr_seconds,
         }
         st.session_state["live_result"] = result
         return result
@@ -263,21 +272,72 @@ def _process_live(source, source_digest):
 
 
 def _render_live_result(result) -> None:
-    st.subheader("📝 Transcript")
-    st.write(result["transcript"])
-    if result["tts_chunks"] > 1:
-        st.caption(f"Speech was generated in {result['tts_chunks']} chunks to fit the TTS service limit.")
-    st.subheader("🔊 Generated speech")
-    st.audio(media_data_uri(result["generated_wav"], "audio/wav"), format="audio/wav")
+    st.subheader("Review and correct the transcript")
+    edited_text = st.text_area(
+        "Transcript to synthesize",
+        value=result["transcript"],
+        height=120,
+        key=f"live_transcript_{result['digest']}",
+        help="Correct recognition mistakes here. Speech generation uses this edited text.",
+    ).strip()
+    if result.get("generated_text") != edited_text:
+        result.pop("generated_wav", None)
+        result.pop("generated_seconds", None)
+        result.pop("tts_seconds", None)
+        result.pop("tts_chunks", None)
+    if st.button(
+        "Generate speech from reviewed transcript",
+        type="primary",
+        width="stretch",
+        disabled=not bool(normalize_reference_text(edited_text)),
+        key=f"live_synthesize_{result['digest']}",
+    ):
+        try:
+            with st.status("Generating speech with Bulbul…", expanded=True) as status:
+                generated_wav, tts_seconds, generated_seconds, tts_chunks = synthesize_in_chunks(
+                    edited_text,
+                    on_chunk=lambda index, total: status.write(
+                        f"Generating speech chunk {index} of {total}…"
+                    ),
+                )
+                status.update(label="Speech generation complete", state="complete", expanded=False)
+            result.update({
+                "generated_text": edited_text,
+                "generated_wav": generated_wav,
+                "tts_seconds": tts_seconds,
+                "generated_seconds": generated_seconds,
+                "tts_chunks": tts_chunks,
+            })
+            st.session_state["live_result"] = result
+        except Exception as exc:
+            logger.exception("Live TTS failed")
+            st.error(f"Speech generation failed: {type(exc).__name__}: {exc}")
+
+    st.subheader("Transcription diagnostics")
+    peak = result["audio_info"]["input_peak"]
+    rms = float(np.sqrt(np.mean(np.square(result["audio"], dtype=np.float64)))) if len(result["audio"]) else 0.0
+    rms_dbfs = float(20 * np.log10(max(rms, 1e-8)))
+    st.caption(f"Input duration: {result['input_seconds']:.1f} s · Peak: {peak:.3f} · RMS: {rms_dbfs:.1f} dBFS")
+    if rms_dbfs < -35:
+        st.warning("The recording is very quiet. Try speaking closer to the microphone and record again.")
+    if result["audio_info"]["clipping_fraction"] >= 0.005:
+        st.warning("The recording may be clipped. Reduce the microphone input level and try again.")
+
+    if "generated_wav" in result and result.get("generated_text") == edited_text:
+        if result["tts_chunks"] > 1:
+            st.caption(f"Speech was generated in {result['tts_chunks']} chunks to fit the TTS service limit.")
+        st.subheader("Generated speech")
+        st.audio(media_data_uri(result["generated_wav"], "audio/wav"), format="audio/wav")
     st.divider()
-    try:
-        render_metrics_dashboard(
-            result["audio"], result["sample_rate"], result["generated_wav"], result["transcript"],
-            result["input_seconds"], result["asr_seconds"], result["tts_seconds"], result["generated_seconds"],
-        )
-    except Exception:
-        logger.exception("Live speech metrics rendering failed")
-        st.warning("Speech generation succeeded, but its metrics and charts could not be displayed.")
+    if "generated_wav" in result and result.get("generated_text") == edited_text:
+        try:
+            render_metrics_dashboard(
+                result["audio"], result["sample_rate"], result["generated_wav"], edited_text,
+                result["input_seconds"], result["asr_seconds"], result["tts_seconds"], result["generated_seconds"],
+            )
+        except Exception:
+            logger.exception("Live speech metrics rendering failed")
+            st.warning("Speech generation succeeded, but its metrics and charts could not be displayed.")
 
 
 def render_mode_overview(mode: str) -> None:
@@ -293,10 +353,10 @@ def render_mode_overview(mode: str) -> None:
             st.markdown("""
             **Live pipeline**
             1. Record or upload a Hindi audio clip (up to 25 minutes; maximum file size 50 MB).
-            2. Transcribe it with Koyal Hindi ASR 120M.
-            3. Generate speech from the transcript with Sarvam Bulbul v3.
-            4. Review the transcript, generated audio, audio diagnostics, pitch and
-               energy contours, processing latency, and real-time factors.
+            2. Transcribe it with Koyal Hindi ASR 120M and review/correct the editable transcript.
+            3. Generate speech with Sarvam Bulbul v3 only after you confirm the text.
+            4. Review the generated audio, recording diagnostics, pitch and energy contours,
+               processing latency, and real-time factors.
 
             Live mode does not require a reference transcript, so it does not report
             reference-based WER or CER.
@@ -312,7 +372,7 @@ def render_mode_overview(mode: str) -> None:
 
             Scores are research evidence, not proof that a recording is genuine or fake.
             """)
-        else:
+        elif mode in ("Research", "Batch Research"):
             st.markdown("""
             **Research pipeline**
             1. Provide a golden-reference transcript and record or upload audio
@@ -320,11 +380,13 @@ def render_mode_overview(mode: str) -> None:
             2. Choose the language variety (Hindi, Hindi-English code-mixed, Sanskrit) and the
                ASR and TTS models to compare on the same recording. Unsupported model-language
                pairs are reported, not run.
-            3. Review preprocessing and VAD diagnostics, normalized / raw / script-tolerant WER,
+            3. Use the reference, an ASR transcript, or reviewed custom text as TTS input.
+               Maya 2 Native is available through a configured remote speech API for Hindi.
+            4. Review preprocessing and VAD diagnostics, normalized / raw / script-tolerant WER,
                CER and word-level alignment, inference latency and real-time factor (model
                loading shown separately), TTS loopback and optional UTMOS scores, voice control,
                prosody and voice measurements, and an optional synthetic-speech check.
-            4. Batch Research adds corpus WER/CER with 95% confidence intervals per variety.
+            5. Batch Research adds corpus WER/CER with 95% confidence intervals per variety.
 
             Local models load only when selected. Model availability and memory
             requirements vary by deployment.
@@ -334,7 +396,7 @@ def render_mode_overview(mode: str) -> None:
 st.title("🗣️ Hindi ASR → TTS Pipeline")
 mode = st.radio(
     "Choose a workflow",
-    ["Live", "Research", "Batch Research", "Synthetic speech"],
+    ["Research", "Live", "Batch Research", "Synthetic speech"],
     horizontal=True,
     key="app_mode",
 )

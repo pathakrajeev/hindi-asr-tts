@@ -157,13 +157,13 @@ def missing_secrets(names) -> list[str]:
 
 
 @st.cache_resource(show_spinner="Loading Koyal Hindi ASR model…")
-def load_koyal():
+def load_koyal(device: str = "cpu"):
     import nemo.collections.asr as nemo_asr
 
     checkpoint = hf_hub_download(
         KOYAL_MODEL_ID, KOYAL_CHECKPOINT, revision=KOYAL_REVISION, token=secret("HF_TOKEN")
     )
-    return nemo_asr.models.ASRModel.restore_from(checkpoint, map_location="cpu").eval()
+    return nemo_asr.models.ASRModel.restore_from(checkpoint, map_location=device).eval()
 
 
 def decode_audio(raw: bytes, suffix: str, max_seconds: float, return_info: bool = False):
@@ -212,6 +212,18 @@ def decode_audio(raw: bytes, suffix: str, max_seconds: float, return_info: bool 
     if return_info:
         return audio, sample_rate, duration, info
     return audio, sample_rate, duration
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def audio_quality_preview(raw: bytes, suffix: str, max_seconds: float) -> dict[str, float]:
+    audio, _, duration, info = decode_audio(raw, suffix, max_seconds, return_info=True)
+    rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) if len(audio) else 0.0
+    return {
+        "duration": duration,
+        "peak": float(info["input_peak"]),
+        "rms_dbfs": float(20 * np.log10(max(rms, 1e-8))),
+        "clipping_fraction": float(info["clipping_fraction"]),
+    }
 
 
 # ---------------------------------------------------------------- VAD and ASR windows
