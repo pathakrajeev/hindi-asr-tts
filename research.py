@@ -1094,7 +1094,7 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
         clips += [(r["label"], "generated (known synthetic)", r["audio"], r["sr"])
                   for r in tts_rows if r["status"] == "ok"]
         synthetic, _ = step("Synthetic-speech check", deepfake.score_clips, clips,
-                            st.session_state.get("deepfake_detector"))
+                            st.session_state.get("deepfake_detector"), device)
 
     return {"audio": audio, "sr": sr, "reference": reference_text, "language": language, "pre": pre,
             "asr": asr_rows, "tts_text": tts_text, "tts_source": source, "tts_truncated": truncated,

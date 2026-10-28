@@ -59,6 +59,12 @@ def prepare(audio: np.ndarray, sr: int) -> np.ndarray:
     return y.astype(np.float32)
 
 
+def _inference_device(use_gpu: bool = True) -> str:
+    import torch
+
+    return "cuda:0" if use_gpu and torch.cuda.is_available() else "cpu"
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
@@ -93,12 +99,12 @@ def decode_upload(raw: bytes, suffix: str) -> tuple[np.ndarray, int]:
 
 
 @st.cache_resource(show_spinner="Loading the zero-shot synthetic-speech detector…")
-def load_zero_shot():
+def load_zero_shot(device: str = "cpu"):
     from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
     kwargs = {"revision": ZERO_SHOT_REVISION} if ZERO_SHOT_REVISION else {}
     extractor = AutoFeatureExtractor.from_pretrained(ZERO_SHOT_ID, **kwargs)
-    model = AutoModelForAudioClassification.from_pretrained(ZERO_SHOT_ID, **kwargs).eval()
+    model = AutoModelForAudioClassification.from_pretrained(ZERO_SHOT_ID, **kwargs).to(device).eval()
     return extractor, model, _synthetic_index(model)
 
 
@@ -126,25 +132,27 @@ def window_spans(n: int) -> list[tuple[int, int]]:
     return spans or [(0, n)]
 
 
-def zero_shot_windows(y16: np.ndarray) -> np.ndarray:
+def zero_shot_windows(y16: np.ndarray, device: str = "cpu") -> np.ndarray:
     """P(synthetic) for each window from window_spans() of a prepared 16 kHz clip."""
     import torch
 
-    extractor, model, synthetic = load_zero_shot()
+    extractor, model, synthetic = load_zero_shot(device)
     probs = []
     with torch.inference_mode():
         for start, end in window_spans(len(y16)):
             window = y16[start:end]
             window = np.pad(window, (0, max(0, WINDOW - len(window))))
-            logits = model(**extractor(window, sampling_rate=SR, return_tensors="pt")).logits
+            inputs = extractor(window, sampling_rate=SR, return_tensors="pt")
+            inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+            logits = model(**inputs).logits
             probs.append(float(logits.softmax(-1)[0, synthetic]))
     return np.asarray(probs, dtype=np.float32)
 
 
-def zero_shot_summary(y16: np.ndarray, probs: np.ndarray | None = None) -> dict:
+def zero_shot_summary(y16: np.ndarray, probs: np.ndarray | None = None, device: str = "cpu") -> dict:
     """Window scores with silence marked, and a summary over SPEECH windows only.
     Silent windows say nothing about the voice; averaging them in dilutes the score."""
-    probs = zero_shot_windows(y16) if probs is None else np.asarray(probs, dtype=np.float32)
+    probs = zero_shot_windows(y16, device) if probs is None else np.asarray(probs, dtype=np.float32)
     spans = window_spans(len(y16))
     if len(spans) != len(probs):  # defensive: never mis-pair scores and times
         spans = [(i * WINDOW, min(len(y16), (i + 1) * WINDOW)) for i in range(len(probs))]
@@ -169,18 +177,19 @@ def zero_shot_summary(y16: np.ndarray, probs: np.ndarray | None = None) -> dict:
 
 
 @st.cache_resource(show_spinner="Loading the WavLM embedding model…")
-def load_embedder():
+def load_embedder(device: str = "cpu"):
     from transformers import AutoFeatureExtractor, AutoModel
 
     kwargs = {"revision": EMBED_REVISION} if EMBED_REVISION else {}
-    return AutoFeatureExtractor.from_pretrained(EMBED_ID, **kwargs), AutoModel.from_pretrained(EMBED_ID, **kwargs).eval()
+    return (AutoFeatureExtractor.from_pretrained(EMBED_ID, **kwargs),
+            AutoModel.from_pretrained(EMBED_ID, **kwargs).to(device).eval())
 
 
-def embed(y16: np.ndarray, chunk_seconds: int = 30) -> np.ndarray:
+def embed(y16: np.ndarray, chunk_seconds: int = 30, device: str = "cpu") -> np.ndarray:
     """Mean-pooled WavLM embedding over 30-second chunks (whole clip, no truncation)."""
     import torch
 
-    extractor, model = load_embedder()
+    extractor, model = load_embedder(device)
     vectors, weights = [], []
     with torch.inference_mode():
         for start in range(0, max(len(y16), 1), chunk_seconds * SR):
@@ -188,6 +197,7 @@ def embed(y16: np.ndarray, chunk_seconds: int = 30) -> np.ndarray:
             if len(chunk) < 400:
                 continue
             inputs = extractor(chunk, sampling_rate=SR, return_tensors="pt")
+            inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
             vectors.append(model(**inputs).last_hidden_state[0].mean(0).cpu().numpy())
             weights.append(len(chunk))
     if not vectors:
@@ -270,20 +280,22 @@ def detector_from_bytes(raw: bytes) -> dict:
 # ---------------------------------------------------------------- scoring used by Research mode
 
 
-def score_clips(clips, detector: dict | None = None) -> list[dict]:
+def score_clips(clips, detector: dict | None = None, device: str = "cpu") -> list[dict]:
     """clips: [(name, provenance, audio, sr)]. Returns one row per clip."""
     rows = []
     for name, provenance, audio, sr in clips:
         y16 = prepare(audio, sr)
         row = {"clip": name, "provenance": provenance, "duration_s": len(y16) / SR}
         try:
-            row |= zero_shot_summary(y16)
+            row |= zero_shot_summary(y16, device=device)
         except Exception as exc:
             row["zero_shot_error"] = f"{type(exc).__name__}: {exc}"
         if detector is not None:
             try:
                 prepared = mp3_roundtrip(y16) if detector.get("roundtrip") else y16
-                row["own_detector"] = float(detector["model"].predict_proba(embed(prepared)[None, :])[0, 1])
+                row["own_detector"] = float(
+                    detector["model"].predict_proba(embed(prepared, device=device)[None, :])[0, 1]
+                )
             except Exception as exc:
                 row["own_detector_error"] = f"{type(exc).__name__}: {exc}"
         rows.append(row)
@@ -349,7 +361,8 @@ def _dataset() -> list[dict]:
     return st.session_state.setdefault("deepfake_dataset", [])
 
 
-def add_clip(name, label, generator, group, audio, sr, roundtrip: bool, zero_shot: bool) -> str:
+def add_clip(name, label, generator, group, audio, sr, roundtrip: bool, zero_shot: bool,
+             device: str = "cpu") -> str:
     """Embed one clip and store it (vectors only, not audio). Returns 'added' or 'duplicate'."""
     y16 = prepare(audio, sr)
     clip_id = hashlib.sha256(y16.tobytes() + f"{roundtrip}".encode()).hexdigest()[:16]
@@ -358,9 +371,9 @@ def add_clip(name, label, generator, group, audio, sr, roundtrip: bool, zero_sho
         return "duplicate"
     prepared = mp3_roundtrip(y16) if roundtrip else y16
     item = {"id": clip_id, "name": name, "label": int(label), "generator": generator, "group": str(group),
-            "embedding": embed(prepared), "roundtrip": bool(roundtrip), "zero_shot": float("nan")}
+            "embedding": embed(prepared, device=device), "roundtrip": bool(roundtrip), "zero_shot": float("nan")}
     if zero_shot:
-        item["zero_shot"] = zero_shot_summary(y16)["zero_shot_mean"]
+        item["zero_shot"] = zero_shot_summary(y16, device=device)["zero_shot_mean"]
     dataset.append(item)
     return "added"
 
@@ -411,16 +424,32 @@ def render_synthetic_mode() -> None:
         "Build a labelled set from your real recordings and this app's TTS outputs, train a detector, and "
         "test it on speakers and TTS engines it has not seen. Results are research evidence, not proof."
     )
+    gpu_available = _inference_device() == "cuda:0"
+    use_gpu = st.toggle(
+        "Use GPU for synthetic-speech detector models",
+        value=gpu_available,
+        disabled=not gpu_available,
+        key="deepfake_use_gpu",
+        help="Zero-shot and WavLM inference use CUDA when available. Audio preparation and classifier training remain on CPU.",
+    )
+    device = _inference_device(use_gpu)
+    if use_gpu:
+        import torch
+
+        gpu = torch.cuda.get_device_properties(0)
+        st.caption(f"CUDA enabled · {torch.cuda.get_device_name(0)} · {gpu.total_memory / 1024**3:.1f} GB VRAM")
+    elif not gpu_available:
+        st.caption("CUDA GPU not detected. Detector models will use CPU.")
     tabs = st.tabs(["Check a file", "Build dataset", "Train & evaluate"])
     with tabs[0]:
-        _render_check_tab()
+        _render_check_tab(device)
     with tabs[1]:
-        _render_dataset_tab()
+        _render_dataset_tab(device)
     with tabs[2]:
         _render_train_tab()
 
 
-def _render_check_tab() -> None:
+def _render_check_tab(device: str = "cpu") -> None:
     detector = st.session_state.get("deepfake_detector")
     saved = st.file_uploader("Load a saved detector (.joblib) — only files you created with this app",
                              type=["joblib"], key="deepfake_detector_upload")
@@ -442,14 +471,14 @@ def _render_check_tab() -> None:
             with st.spinner("Scoring…"):
                 audio, sr = decode_upload(source.getvalue(), Path(getattr(source, "name", "recording.wav")).suffix)
                 st.session_state["deepfake_check_rows"] = score_clips(
-                    [(getattr(source, "name", "recording"), "unknown", audio, sr)], detector)
+                    [(getattr(source, "name", "recording"), "unknown", audio, sr)], detector, device)
         except Exception as exc:
             st.error(f"Scoring failed: {type(exc).__name__}: {exc}")
     if st.session_state.get("deepfake_check_rows"):
         render_scores(st.session_state["deepfake_check_rows"])
 
 
-def _render_dataset_tab() -> None:
+def _render_dataset_tab(device: str = "cpu") -> None:
     columns = st.columns(2)
     roundtrip = columns[0].toggle("MP3 codec control", value=ffmpeg_available(), disabled=not ffmpeg_available(),
                                   key="deepfake_roundtrip",
@@ -483,7 +512,7 @@ def _render_dataset_tab() -> None:
                           for r in result["tts"] if r["status"] == "ok"]
                 for name, label, generator, audio, sr in clips:
                     try:
-                        counts[add_clip(name, label, generator, group, audio, sr, roundtrip, zero_shot)] += 1
+                        counts[add_clip(name, label, generator, group, audio, sr, roundtrip, zero_shot, device)] += 1
                     except Exception as exc:
                         counts["failed"] += 1
                         st.warning(f"{name}: {type(exc).__name__}: {exc}")
@@ -514,7 +543,7 @@ def _render_dataset_tab() -> None:
                 try:
                     audio, sr = decode_upload(upload.getvalue(), Path(upload.name).suffix)
                     added += add_clip(upload.name, int(is_fake), generator, meta["group"], audio, sr,
-                                      roundtrip, zero_shot) == "added"
+                                      roundtrip, zero_shot, device) == "added"
                 except Exception as exc:
                     st.warning(f"{upload.name}: {type(exc).__name__}: {exc}")
             st.success(f"Added {added} file(s).")

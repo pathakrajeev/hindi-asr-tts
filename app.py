@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import soundfile as sf
 import streamlit as st
+import torch
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -187,6 +188,19 @@ def render_metrics_dashboard(
 def render_live_tab() -> None:
     st.subheader("Live mode")
     st.info("Record or upload Hindi speech, review and correct Koyal's transcript, then generate speech from the corrected text.")
+    gpu_available = torch.cuda.is_available()
+    use_gpu = st.toggle(
+        "Use GPU for local Koyal transcription",
+        value=gpu_available,
+        disabled=not gpu_available,
+        key="live_use_gpu",
+        help="Audio preprocessing stays on CPU; Koyal inference runs on CUDA when enabled.",
+    )
+    if gpu_available and use_gpu:
+        gpu = torch.cuda.get_device_properties(0)
+        st.caption(f"CUDA enabled · {torch.cuda.get_device_name(0)} · {gpu.total_memory / 1024**3:.1f} GB VRAM")
+    elif not gpu_available:
+        st.caption("CUDA GPU not detected. Koyal will use CPU.")
     left, right = st.columns(2)
     with left:
         recording = st.audio_input("Record Hindi speech", key="live_recording")
@@ -228,12 +242,12 @@ def render_live_tab() -> None:
         if source is None:
             st.error("Record or upload audio before starting transcription.")
             return
-        stored = _process_live(source, source_digest)
+        stored = _process_live(source, source_digest, use_gpu)
     if stored is not None:
         _render_live_result(stored)
 
 
-def _process_live(source, source_digest):
+def _process_live(source, source_digest, use_gpu=False):
     raw = source.getvalue()
     try:
         with st.status("Processing live audio…", expanded=True) as status:
@@ -248,7 +262,9 @@ def _process_live(source, source_digest):
                 )
             else:
                 st.write("Transcribing with Koyal…")
-            transcript, asr_seconds = transcribe(audio, sample_rate)
+            device = "cuda:0" if use_gpu and torch.cuda.is_available() else "cpu"
+            st.write(f"Koyal inference device: {device}. Audio processing remains on CPU.")
+            transcript, asr_seconds = transcribe(audio, sample_rate, device)
             status.update(label="Transcription complete", state="complete", expanded=False)
         result = {
             "digest": source_digest, "audio": audio, "sample_rate": sample_rate, "input_seconds": input_seconds,

@@ -304,9 +304,9 @@ def speech_windows(audio: np.ndarray, sample_rate: int) -> list[tuple[int, int]]
     return build_windows(len(audio), sample_rate, segments)
 
 
-def transcribe(audio: np.ndarray, sample_rate: int) -> tuple[str, float]:
+def transcribe(audio: np.ndarray, sample_rate: int, device: str = "cpu") -> tuple[str, float]:
     """Koyal transcript and inference seconds (model download/loading excluded)."""
-    model = load_koyal()
+    model = load_koyal(device)
     windows = speech_windows(audio, sample_rate)
     segments = [np.ascontiguousarray(audio[start:end], dtype=np.float32) for start, end in windows]
     started = time.perf_counter()

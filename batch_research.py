@@ -21,7 +21,7 @@ import stats
 from speech_core import (LANGUAGES, PRIMARY_LABEL, PRIMARY_METRIC, SAMPLE_RATE, decode_audio, guess_language,
                          normalize_reference_text)
 from research import (ASR_ENGINES, TARGET_VOICE, TTS_ENGINES, _settings_digest, engine_support, heard_voice,
-                      render_result_tabs, run_research)
+                      _inference_device, render_result_tabs, run_research)
 
 AUDIO_EXTENSIONS = ["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"]
 PROVENANCE = ["unknown", "human_from_scratch", "machine_draft_corrected", "published_text"]
@@ -43,20 +43,20 @@ def acoustic_embedding(audio, sr, mfcc_dim=40):
 
 
 @st.cache_resource(show_spinner=False)
-def wav2vec_bundle(model_id):
+def wav2vec_bundle(model_id, device="cpu"):
     from transformers import AutoFeatureExtractor, AutoModel
     import torch
     extractor = AutoFeatureExtractor.from_pretrained(model_id)
-    model = AutoModel.from_pretrained(model_id).eval()
+    model = AutoModel.from_pretrained(model_id).to(device).eval()
     return extractor, model
 
 
-def wav2vec_embedding(audio, sr, model_id):
+def wav2vec_embedding(audio, sr, model_id, device="cpu"):
     import torch
     y = librosa.resample(audio, orig_sr=sr, target_sr=16000) if sr != 16000 else audio
     # Whole recording in 30-second chunks (previously only the first 30 s were used),
     # averaged with chunk-length weights so a short tail chunk does not count as much.
-    extractor, model = wav2vec_bundle(model_id)
+    extractor, model = wav2vec_bundle(model_id, device)
     vectors, weights = [], []
     with torch.inference_mode():
         for start in range(0, max(len(y), 1), 30 * 16000):
@@ -64,6 +64,7 @@ def wav2vec_embedding(audio, sr, model_id):
             if len(chunk) < 400:  # under 25 ms: too short for the feature encoder
                 continue
             inputs = extractor(chunk, sampling_rate=16000, return_tensors="pt", padding=True)
+            inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
             vectors.append(model(**inputs).last_hidden_state[0].mean(dim=0).cpu().numpy())
             weights.append(len(chunk))
     if not vectors:
@@ -196,6 +197,23 @@ def render_batch_tab():
         )
         utmos = columns[1].toggle("UTMOS score", value=False, key="batch_utmos")
         denoise = columns[2].toggle("Adaptive denoising", value=True, key="batch_denoise")
+        gpu_available = _inference_device(True).type == "cuda"
+        use_gpu = st.toggle(
+            "Use GPU for local models",
+            value=gpu_available,
+            disabled=not gpu_available,
+            key="batch_use_gpu",
+            help="Run supported local ASR/TTS models and Wav2Vec2 embeddings on CUDA. Audio preprocessing, MFCC embeddings, MFA, and scoring remain on CPU.",
+        )
+        if gpu_available and use_gpu:
+            import torch
+
+            gpu = torch.cuda.get_device_properties(0)
+            st.caption(f"CUDA enabled · {torch.cuda.get_device_name(0)} · {gpu.total_memory / 1024**3:.1f} GB VRAM")
+        elif gpu_available:
+            st.caption("Local models will run on CPU; CUDA is available but disabled.")
+        else:
+            st.info("CUDA GPU not detected. Local models and Wav2Vec2 embeddings will use CPU.")
         embed_mode = st.selectbox("Audio embeddings", ["MFCC + delta statistics", "Wav2Vec2 learned features", "Off"], key="batch_embed")
         model_id = "facebook/wav2vec2-base-960h"
         if embed_mode == "Wav2Vec2 learned features":
@@ -229,7 +247,7 @@ def render_batch_tab():
 
         settings = {"asr": asr, "tts": tts, "judge": judge, "utmos": utmos, "denoise": denoise,
                     "embed": embed_mode, "model_id": model_id, "mfa": enable_mfa,
-                    "dictionaries": dictionaries, "acoustics": acoustics,
+                    "dictionaries": dictionaries, "acoustics": acoustics, "use_gpu": use_gpu,
                     "metadata": edited.to_dict("records")}
         audio_bytes = b"".join(upload.getvalue() for upload in uploads)
         digest = _settings_digest(audio_bytes, "", settings)
@@ -256,7 +274,8 @@ def render_batch_tab():
                     audio, sr, duration, info = decode_audio(upload.getvalue(), Path(name).suffix, 120, return_info=True)
                     options = {"asr": asr, "tts": tts, "tts_source": "reference", "judge": judge,
                                "sarvam_mode": "codemix", "denoise": denoise, "utmos": utmos, "release": True,
-                               "language": language, "clipping_fraction": info["clipping_fraction"]}
+                               "language": language, "clipping_fraction": info["clipping_fraction"],
+                               "use_gpu": use_gpu}
                     with st.status(f"{name}: running models", expanded=False) as status:
                         result = run_research(audio, sr, text, options, status)
                     result["name"] = name
@@ -266,7 +285,8 @@ def render_batch_tab():
                     results.append(result)
                     if embed_mode != "Off":
                         vector = (acoustic_embedding(audio, sr) if embed_mode.startswith("MFCC")
-                                  else wav2vec_embedding(audio, sr, model_id))
+                                  else wav2vec_embedding(audio, sr, model_id,
+                                                         str(_inference_device(use_gpu))))
                         embeddings.append({"file": name, "embedding": vector})
                     if enable_mfa:
                         if language not in ("hi", "sa"):
