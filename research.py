@@ -5,11 +5,11 @@ import html
 import io
 import logging
 import re
+import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import altair as alt
 import librosa
@@ -77,24 +77,7 @@ SRAVAANI_MODEL_ID = "ARTPARK-IISc/SraVaani-1.0"
 SRAVAANI_MODEL_REVISION = "f5dd5358325a5208775b91dad98918e079ea2b27"
 MMS_MODEL_ID = "facebook/mms-tts-hin"
 MMS_REVISION = "1d83b223ec78e30b944f7d96bd117eb3d7023303"
-PARLER_MODEL_ID = "ai4bharat/indic-parler-tts"
-PARLER_REVISION = "660bc53c64ae83150613264111708a0465211237"
-PARLER_DESCRIPTION_MODEL_REVISIONS = {
-    "google/flan-t5-large": "0613663d0d48ea86ba8cb3d7a44f0f65dc596a2a",
-}
-PARLER_DESCRIPTION = (
-    "Divya, a female speaker, speaks Hindi at a moderate pace with balanced pitch and slight "
-    "expressiveness. The recording is very clear, close-sounding, and has almost no background noise."
-)
-# Indic Parler-TTS recommended Sanskrit speaker (as used by the notebook). Aryan is male, so
-# Sanskrit TTS cannot meet the female voice control.
-PARLER_DESCRIPTION_SA = (
-    "Aryan, a male speaker, speaks Sanskrit at a moderate pace with balanced pitch. "
-    "The recording is very clear, close-sounding, and has almost no background noise."
-)
-PARLER_CHUNK_CHARS = 180  # same as the notebook's parler_chunk_chars
-TARGET_VOICE = "female"   # thesis control: TTS engines are ranked only on confirmed-female voices
-HEARD_VOICE_OPTIONS = ["not checked", "female", "male", "unsure"]
+FEMALE_VOICE_F0_THRESHOLD_HZ = 165.0
 
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 REFERENCE_COLOR = "#52514e"
@@ -109,14 +92,12 @@ ASR_ENGINES = {
 }
 TTS_ENGINES = {
     "bulbul-v3": {"label": "Sarvam Bulbul v3", "memory": "API", "heavy": False},
-    "maya2-native": {"label": "Maya 2 Native (remote API)", "memory": "API", "heavy": False},
+    "maya2-native": {"label": "Maya 2 Native (local GPU)", "memory": "~9.2 GB VRAM peak", "heavy": True},
     "mms-tts-hin": {"label": "Meta MMS-TTS Hindi", "memory": "~0.15 GB", "heavy": False},
-    "indic-parler-tts": {"label": "Indic Parler-TTS", "memory": "~3.5 GB", "heavy": True},
 }
-MAYA_VOICES = [
-    "Ahana", "Vaidehi", "Malini", "Charvi", "Jahnavi", "Anirban", "Nakul", "Vasant",
-    "Siddhant", "Satvik", "Abhay", "Nivedita", "Ishwari", "Ritvik", "Vrinda", "Sreekar",
-    "Kayal", "Shaunak", "Akshat", "Tanushree",
+MAYA_FEMALE_VOICES = [
+    "Ahana", "Vaidehi", "Malini", "Charvi", "Jahnavi",
+    "Nivedita", "Ishwari", "Vrinda", "Kayal", "Tanushree",
 ]
 ASR_COLORS = {key: PALETTE[index] for index, key in enumerate(ASR_ENGINES)}
 
@@ -143,8 +124,6 @@ _SUPPORT = {
     "mms-tts-hin": {"hi": (True, ""),
                     "hi-en": (True, "Latin-script words may be mispronounced (model limitation)."),
                     "sa": (False, "No validated Sanskrit MMS checkpoint configured.")},
-    "indic-parler-tts": {"hi": (True, ""), "hi-en": (True, ""),
-                         "sa": (True, "Sanskrit voice Aryan (male): outside the female voice control.")},
 }
 
 
@@ -180,13 +159,35 @@ def load_whisper(device: str = "cpu"):
 @st.cache_resource(show_spinner=False)
 def load_indic_conformer(device: str = "cpu"):
     from transformers import AutoModel
+    from huggingface_hub import snapshot_download
 
+    token = secret("HF_TOKEN") or None
+    snapshot_dir = Path(snapshot_download(
+        INDIC_CONFORMER_MODEL_ID,
+        revision=INDIC_CONFORMER_REVISION,
+        token=token,
+    ))
+    _materialize_snapshot_files(snapshot_dir)
     return AutoModel.from_pretrained(
         INDIC_CONFORMER_MODEL_ID,
         revision=INDIC_CONFORMER_REVISION,
         trust_remote_code=True,
-        token=secret("HF_TOKEN") or None,
+        token=token,
     ).to(device).eval()
+
+
+def _materialize_snapshot_files(snapshot_dir: Path) -> None:
+    for path in snapshot_dir.rglob("*"):
+        if not path.is_symlink():
+            continue
+        target = path.resolve(strict=True)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            shutil.copyfile(target, temporary_path)
+            temporary_path.replace(path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _process_rss_mb() -> str:
@@ -292,36 +293,24 @@ def load_mms(device: str = "cpu"):
     return model, tokenizer
 
 
-@st.cache_resource(show_spinner=False)
-def load_parler(device: str = "cpu"):
+@st.cache_resource(show_spinner="Loading Maya 2 Native on the GPU…")
+def load_maya(device: str = "cpu"):
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("Maya 2 Native currently requires Linux; use WSL2 with GPU passthrough or a Linux deployment.")
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        raise RuntimeError("Maya 2 Native requires a CUDA-enabled NVIDIA GPU; enable the GPU option and GPU hardware.")
+    if torch.version.cuda != "12.8":
+        raise RuntimeError(
+            f"Maya 2 Native requires the CUDA 12.8 PyTorch build; this environment reports CUDA {torch.version.cuda or 'unavailable'}. "
+            "Reinstall dependencies from requirements.txt."
+        )
     try:
-        from parler_tts import ParlerTTSForConditionalGeneration
+        from maya3 import Maya3TTS
     except ImportError as exc:
         raise RuntimeError(
-            "Could not import Indic Parler-TTS. Rebuild the Space from the project's requirements.txt "
-            "so its pinned parler-tts, torch, torchaudio, and transformers versions are installed. "
-            "A separate Python environment would not be available to this Streamlit process."
+            "Maya 2 Native is not installed. Rebuild the app with its CUDA 12.8 / Torch 2.8 dependency profile."
         ) from exc
-    from transformers import AutoTokenizer
-
-    token = secret("HF_TOKEN") or None
-    model = ParlerTTSForConditionalGeneration.from_pretrained(
-        PARLER_MODEL_ID, revision=PARLER_REVISION, token=token
-    ).to(device).eval()
-    prompt_tokenizer = AutoTokenizer.from_pretrained(
-        PARLER_MODEL_ID, revision=PARLER_REVISION, token=token
-    )
-    description_model_id = model.config.text_encoder._name_or_path
-    description_revision = PARLER_DESCRIPTION_MODEL_REVISIONS.get(description_model_id)
-    if description_revision is None:
-        raise RuntimeError(
-            f"No pinned tokenizer revision is configured for Indic Parler-TTS text encoder "
-            f"{description_model_id!r}."
-        )
-    description_tokenizer = AutoTokenizer.from_pretrained(
-        description_model_id, revision=description_revision, token=token
-    )
-    return model, prompt_tokenizer, description_tokenizer
+    return Maya3TTS.from_pretrained("maya-research/maya2-native", max_seats=1)
 
 
 @st.cache_resource(show_spinner=False)
@@ -336,7 +325,7 @@ RELEASERS = {
     "indic-conformer-rnnt": load_indic_conformer,
     "sravaani": load_sravaani,
     "mms-tts-hin": load_mms,
-    "indic-parler-tts": load_parler,
+    "maya2-native": load_maya,
 }
 # Loaders are called in their own timed step, so latency and RTF measure inference only.
 LOADERS = RELEASERS
@@ -353,6 +342,8 @@ def release_unless_needed(key: str, upcoming: list[str]) -> None:
 def release(key: str) -> None:
     loader = RELEASERS.get(key)
     if loader is not None:
+        if key == "maya2-native":
+            loader("cuda:0").close()
         loader.clear()
         collected = gc.collect()
         heap = _trim_process_heap()
@@ -641,50 +632,19 @@ def tts_bulbul(text, language="hi"):
 
 
 def tts_maya(text, language="hi", voice="Ahana"):
-    """Call a Maya 2 Native OpenAI-compatible speech endpoint configured by the Space owner."""
-    base_url = secret("MAYA_API_BASE_URL").rstrip("/")
-    if not base_url:
-        raise RuntimeError("Set MAYA_API_BASE_URL in the Hugging Face Space secrets to enable Maya.")
-    parsed = urlsplit(base_url)
-    if parsed.scheme != "https" and not (
-        parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
-    ):
-        raise RuntimeError("MAYA_API_BASE_URL must use HTTPS (HTTP is allowed only for localhost).")
-    if not parsed.hostname or parsed.query or parsed.fragment:
-        raise RuntimeError("MAYA_API_BASE_URL must be a server URL without query parameters or fragments.")
-    if parsed.path.rstrip("/").endswith("/v1/audio/speech"):
-        endpoint = base_url.rstrip("/")
-    elif parsed.path.rstrip("/").endswith("/v1"):
-        endpoint = f"{base_url.rstrip('/')}/audio/speech"
-    else:
-        endpoint = f"{base_url}/v1/audio/speech"
-    headers = {}
-    api_key = secret("MAYA_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    payload = {
-        "input": text,
-        "language": "hi" if language in {"hi", "hi-en"} else language,
-        "voice": voice,
-        "response_format": "flac",
-        "normalize": True,
-    }
+    """Generate speech locally with the cached Maya 2 Native GPU runtime."""
+    model = load_maya("cuda:0")
     started = time.perf_counter()
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=(10, 180))
-    except requests.RequestException as exc:
-        raise RuntimeError("Network error calling the configured Maya speech API.") from exc
-    if response.status_code in {401, 403}:
-        raise RuntimeError("Maya speech API authorization failed; check MAYA_API_KEY.")
-    if response.status_code != 200:
-        raise RuntimeError(f"Maya speech API returned HTTP {response.status_code}.")
-    try:
-        audio, sr = sf.read(io.BytesIO(response.content), dtype="float32", always_2d=False)
+        audio = model.generate(
+            text,
+            lang="hi" if language in {"hi", "hi-en"} else language,
+            voice=voice,
+            normalize=True,
+        )
     except Exception as exc:
-        raise RuntimeError("Maya API response was not a readable WAV file.") from exc
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    return np.asarray(audio, np.float32), int(sr), time.perf_counter() - started
+        raise RuntimeError(f"Maya 2 Native local generation failed: {type(exc).__name__}: {exc}") from exc
+    return np.asarray(audio, np.float32), 24_000, time.perf_counter() - started
 
 
 def tts_mms(text, language="hi", device="cpu"):
@@ -708,37 +668,7 @@ def tts_mms(text, language="hi", device="cpu"):
     return np.concatenate(parts[:-1]).astype(np.float32), sr, time.perf_counter() - started
 
 
-def tts_parler(text, language="hi", device="cpu"):
-    """Sentence-chunked Parler synthesis. One 2048-token generate call holds only ~24 s of
-    audio, so long texts were silently cut off; chunks of <=180 characters avoid that."""
-    model, prompt_tokenizer, description_tokenizer = load_parler(device)
-    description_text = PARLER_DESCRIPTION_SA if language == "sa" else PARLER_DESCRIPTION
-    description = description_tokenizer(description_text, return_tensors="pt")
-    description = {name: tensor.to(device) for name, tensor in description.items()}
-    sr = int(model.config.sampling_rate)
-    silence = np.zeros(int(0.18 * sr), dtype=np.float32)
-    parts = []
-    started = time.perf_counter()
-    with torch.inference_mode():
-        for chunk in sentence_chunks(text, PARLER_CHUNK_CHARS):
-            torch.manual_seed(TTS_SEED)
-            prompt = prompt_tokenizer(chunk, return_tensors="pt")
-            prompt = {name: tensor.to(device) for name, tensor in prompt.items()}
-            audio = model.generate(
-                input_ids=description.input_ids,
-                attention_mask=description.attention_mask,
-                prompt_input_ids=prompt.input_ids,
-                prompt_attention_mask=prompt.attention_mask,
-                max_new_tokens=2048,
-            )
-            parts += [audio.float().cpu().numpy().squeeze().astype(np.float32), silence]
-    elapsed = time.perf_counter() - started
-    if not parts:
-        raise RuntimeError("Indic Parler-TTS produced no audio for this text.")
-    return np.concatenate(parts[:-1]).astype(np.float32), sr, elapsed
-
-
-TTS_RUNNERS = {"bulbul-v3": tts_bulbul, "mms-tts-hin": tts_mms, "indic-parler-tts": tts_parler}
+TTS_RUNNERS = {"bulbul-v3": tts_bulbul, "mms-tts-hin": tts_mms}
 
 
 def predicted_utmos(audio: np.ndarray, sr: int, device: str = "cpu") -> float:
@@ -1032,7 +962,7 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
                     language,
                     options.get("maya_voice", "Ahana"),
                 )
-            elif key in {"mms-tts-hin", "indic-parler-tts"}:
+            elif key == "mms-tts-hin":
                 result, error = step(f"TTS · {label}", TTS_RUNNERS[key], tts_text, language, device)
             else:
                 result, error = step(f"TTS · {label}", TTS_RUNNERS[key], tts_text, language)
@@ -1048,7 +978,9 @@ def run_research(audio, sr, reference_text, options, status) -> dict:
             if not np.isfinite(out).all() or not len(out):
                 row |= {"status": "failed", "error": "Model returned empty or invalid audio."}
         tts_rows.append(row)
-        if options["release"]:
+        if options["release"] and not (
+            key == "maya2-native" and options.get("defer_maya_release")
+        ):
             release_unless_needed(key, options["tts"][index + 1:])
 
     judge_ok = bool(judge) and engine_support(judge, language)[0]
@@ -1344,44 +1276,45 @@ def render_tts(result):
     _fig_close(fig, "Waveform and log-Mel spectrogram for the input speech and each TTS output")
 
 
-def _voice_key(result, engine_key: str) -> str:
-    return f"heard_voice::{result.get('run_id', result.get('name', 'run'))}::{engine_key}"
-
-
-def heard_voice(result, engine_key: str) -> str:
-    return st.session_state.get(_voice_key(result, engine_key), "not checked")
-
-
 def render_voice_control(result):
-    """Listening confirmation for the thesis voice control. Only engines confirmed as the target
-    voice are ranked; measured F0 is shown as a hint, not as proof of gender."""
+    """Rank TTS candidates using median F0 as a rough voice-range heuristic."""
     ok = [r for r in result["tts"] if r["status"] == "ok"]
     if not ok:
         return
-    st.markdown(f"#### Voice control — rank only confirmed {TARGET_VOICE} voices")
-    st.caption("Listen to each output and record what you hear. Median F0 is a hint only "
-               "(adult female voices are typically above ~165 Hz), not a gender test.")
+    st.markdown("#### Voice control — automatically rank higher-pitch candidates")
+    st.caption(
+        f"Candidates with median F0 at or above {FEMALE_VOICE_F0_THRESHOLD_HZ:.0f} Hz are "
+        "included automatically. F0 is a rough voice-range heuristic, not a gender test."
+    )
     prosody = result.get("prosody", {})
+    ranked = []
     for r in ok:
-        f0 = prosody.get(r["label"], {}).get("metrics", {}).get("F0 median (Hz)", float("nan"))
-        hint = f"median F0 {f0:.0f} Hz" if np.isfinite(f0) else "median F0 unavailable"
-        st.radio(f"{r['label']} — heard voice ({hint})", HEARD_VOICE_OPTIONS, horizontal=True,
-                 key=_voice_key(result, r["key"]))
-    confirmed = [r for r in ok if heard_voice(result, r["key"]) == TARGET_VOICE]
-    if not confirmed:
-        st.info(f"No engine is confirmed as a {TARGET_VOICE} voice yet, so no TTS ranking is shown.")
+        raw_f0 = prosody.get(r["label"], {}).get("metrics", {}).get("F0 median (Hz)")
+        try:
+            f0 = float(raw_f0)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(f0) and f0 >= FEMALE_VOICE_F0_THRESHOLD_HZ:
+            ranked.append((r, f0))
+    if not ranked:
+        st.info(
+            "No successful TTS output has a measurable median F0 at or above "
+            f"{FEMALE_VOICE_F0_THRESHOLD_HZ:.0f} Hz, so no ranking is shown."
+        )
         return
     ranking = pd.DataFrame([{
         "Model": r["label"],
+        "Median F0 (Hz)": f0,
         "Loopback WER (%)": r.get("loopback", {}).get("primary", np.nan),
         "Predicted UTMOS": r.get("utmos") if r.get("utmos") is not None else np.nan,
         "RTF": r["rtf"],
-    } for r in confirmed]).sort_values(["Loopback WER (%)", "Predicted UTMOS"], ascending=[True, False])
-    st.dataframe(ranking, hide_index=True, width="stretch", column_config={
+    } for r, f0 in ranked]).sort_values(["Loopback WER (%)", "Predicted UTMOS"], ascending=[True, False])
+    st.dataframe(ranking, hide_index=True, width="stretch",
+                 alt="TTS candidates with median F0 at or above the heuristic threshold, ranked by quality metrics",
+                 column_config={
         c: st.column_config.NumberColumn(format="%.2f") for c in ranking.columns if c != "Model"
     })
-    st.caption("Ranked by loopback error (intelligibility proxy), then predicted UTMOS. "
-               "Unconfirmed engines are reported above but not ranked.")
+    st.caption("Ranked by loopback error (intelligibility proxy), then predicted UTMOS.")
 
 
 def render_synthetic(result):
@@ -1540,17 +1473,21 @@ def render_research_tab():
         asr = st.multiselect("ASR models", list(ASR_ENGINES), default=["koyal", "sarvam-saaras-v3"],
                              format_func=_format_engine(ASR_ENGINES), key="research_asr")
         default_tts = ["bulbul-v3", "mms-tts-hin"]
-        if secret("MAYA_API_BASE_URL"):
-            default_tts.append("maya2-native")
         tts = st.multiselect("TTS models", list(TTS_ENGINES), default=default_tts,
                              format_func=_format_engine(TTS_ENGINES), key="research_tts")
         if "maya2-native" in tts:
-            maya_voice = st.selectbox("Maya voice", MAYA_VOICES, key="research_maya_voice")
-            maya_base_url = secret("MAYA_API_BASE_URL")
-            if maya_base_url:
-                st.caption("Maya uses the configured remote endpoint; it must support POST /v1/audio/speech. Audio and text are sent to that provider.")
-            else:
-                st.warning("Set MAYA_API_BASE_URL in Hugging Face Space secrets to use Maya 2 Native.")
+            if st.session_state.get("research_maya_voice") not in MAYA_FEMALE_VOICES:
+                st.session_state["research_maya_voice"] = "Ahana"
+            maya_voice = st.selectbox(
+                "Maya female voice",
+                MAYA_FEMALE_VOICES,
+                key="research_maya_voice",
+                help="Only Maya's documented female voice personas are offered here.",
+            )
+            st.caption(
+                "Maya runs locally with Maya3TTS; no endpoint URL or API key is needed. "
+                "First use downloads the model and requires about 9.2 GB VRAM at peak; 12 GB or more is recommended."
+            )
         else:
             maya_voice = "Ahana"
         columns = st.columns(2)
@@ -1592,6 +1529,8 @@ def render_research_tab():
             st.caption("Local models will run on CPU; CUDA is available but disabled.")
         else:
             st.info("CUDA GPU not detected. Local models will use CPU. Enable GPU hardware and install a CUDA-enabled PyTorch build to use acceleration.")
+        if "maya2-native" in tts and not (gpu_available and use_gpu):
+            st.warning("Maya 2 Native requires a CUDA-enabled NVIDIA GPU and the GPU option enabled.")
 
         if tts_source == "custom":
             custom_tts_text = st.text_area(
@@ -1608,15 +1547,13 @@ def render_research_tab():
         unsupported += [TTS_ENGINES[k]["label"] for k in tts if not engine_support(k, language)[0]]
         if unsupported:
             st.info(f"Not run for {LANGUAGES[language]}: {', '.join(unsupported)}.")
-        needs_hf = {"koyal", "indic-conformer-ctc", "indic-conformer-rnnt", "sravaani", "indic-parler-tts"}
+        needs_hf = {"koyal", "indic-conformer-ctc", "indic-conformer-rnnt", "sravaani"}
         needs_sarvam = {"sarvam-saaras-v3", "bulbul-v3"}
         missing = []
         if needs_hf & set(asr + tts) and missing_secrets(["HF_TOKEN"]):
             missing.append("HF_TOKEN (gated Hugging Face models)")
         if needs_sarvam & set(asr + tts) and missing_secrets(["SARVAM_API_KEY"]):
             missing.append("SARVAM_API_KEY (Sarvam Saaras/Bulbul)")
-        if "maya2-native" in tts and missing_secrets(["MAYA_API_BASE_URL"]):
-            missing.append("MAYA_API_BASE_URL (Maya-compatible remote speech endpoint)")
         if missing:
             st.warning("Missing secrets: " + "; ".join(missing) + ". Those models will fail until the secret is added.")
 

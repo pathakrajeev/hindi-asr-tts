@@ -397,7 +397,7 @@ def render_mode_overview(mode: str) -> None:
                ASR and TTS models to compare on the same recording. Unsupported model-language
                pairs are reported, not run.
             3. Use the reference, an ASR transcript, or reviewed custom text as TTS input.
-               Maya 2 Native is available through a configured remote speech API for Hindi.
+               Maya 2 Native runs locally on CUDA when compatible GPU hardware is available.
             4. Review preprocessing and VAD diagnostics, normalized / raw / script-tolerant WER,
                CER and word-level alignment, inference latency and real-time factor (model
                loading shown separately), TTS loopback and optional UTMOS scores, voice control,

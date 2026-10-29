@@ -20,8 +20,8 @@ import streamlit as st
 import stats
 from speech_core import (LANGUAGES, PRIMARY_LABEL, PRIMARY_METRIC, SAMPLE_RATE, decode_audio, guess_language,
                          normalize_reference_text)
-from research import (ASR_ENGINES, TARGET_VOICE, TTS_ENGINES, _settings_digest, engine_support, heard_voice,
-                      _inference_device, render_result_tabs, run_research)
+from research import (ASR_ENGINES, FEMALE_VOICE_F0_THRESHOLD_HZ, TTS_ENGINES, _settings_digest,
+                      engine_support, _inference_device, release, render_result_tabs, run_research)
 
 AUDIO_EXTENSIONS = ["wav", "mp3", "m4a", "mp4", "flac", "ogg", "aac"]
 PROVENANCE = ["unknown", "human_from_scratch", "machine_draft_corrected", "published_text"]
@@ -275,7 +275,7 @@ def render_batch_tab():
                     options = {"asr": asr, "tts": tts, "tts_source": "reference", "judge": judge,
                                "sarvam_mode": "codemix", "denoise": denoise, "utmos": utmos, "release": True,
                                "language": language, "clipping_fraction": info["clipping_fraction"],
-                               "use_gpu": use_gpu}
+                               "use_gpu": use_gpu, "defer_maya_release": "maya2-native" in tts}
                     with st.status(f"{name}: running models", expanded=False) as status:
                         result = run_research(audio, sr, text, options, status)
                     result["name"] = name
@@ -300,6 +300,14 @@ def render_batch_tab():
                 except Exception as exc:
                     errors.append({"file": name, "error": f"{type(exc).__name__}: {exc}"})
                 progress.progress((idx + 1) / len(uploads), text=f"Processed {idx+1}/{len(uploads)}")
+            maya_label = TTS_ENGINES["maya2-native"]["label"]
+            maya_loaded = any(
+                row.get("Step") == f"Load · {maya_label}" and row.get("Status") == "ok"
+                for result in results
+                for row in result["log"]
+            )
+            if maya_loaded:
+                release("maya2-native")
             st.session_state["batch_results"] = (results, embeddings, alignment_rows, errors)
             st.session_state["batch_digest"] = digest
         stored = st.session_state.get("batch_results")
@@ -472,11 +480,16 @@ def _tts_rows(results) -> pd.DataFrame:
     for result in results:
         for row in result["tts"]:
             loop = row.get("loopback", {})
+            raw_f0 = result.get("prosody", {}).get(row["label"], {}).get("metrics", {}).get("F0 median (Hz)")
+            try:
+                median_f0 = float(raw_f0)
+            except (TypeError, ValueError):
+                median_f0 = np.nan
             rows.append({
                 "file": result["name"], "language": result["language"], "engine_key": row["key"], "engine": row["label"],
                 "status": row["status"], "loopback (%)": loop.get("primary"), "loopback WER norm (%)": loop.get("wer"),
                 "loopback CER (%)": loop.get("cer"), "UTMOS": row.get("utmos"), "RTF": row.get("rtf"),
-                "heard voice": heard_voice(result, row["key"]) if row["status"] == "ok" else "",
+                "Median F0 (Hz)": median_f0,
                 "note": row.get("error") if row["status"] != "ok" else row.get("note", ""),
             })
     return pd.DataFrame(rows)
@@ -489,21 +502,29 @@ def _render_tts_summary(results, table: pd.DataFrame) -> None:
     ok = table[table.status == "ok"].copy()
     if ok.empty:
         return
-    ok["voice controlled"] = ok["heard voice"] == TARGET_VOICE
+    ok["higher-pitch candidate"] = (
+        pd.to_numeric(ok["Median F0 (Hz)"], errors="coerce") >= FEMALE_VOICE_F0_THRESHOLD_HZ
+    )
     for column in ("loopback (%)", "UTMOS", "RTF"):
         ok[column] = pd.to_numeric(ok[column], errors="coerce")
     summary = ok.groupby(["language", "engine"]).agg(
-        files=("file", "nunique"), voice_confirmed_files=("voice controlled", "sum"),
+        files=("file", "nunique"), higher_pitch_files=("higher-pitch candidate", "sum"),
         loopback_mean=("loopback (%)", "mean"), utmos_mean=("UTMOS", "mean"), rtf_mean=("RTF", "mean"),
     ).reset_index()
-    summary["ranked"] = summary.voice_confirmed_files == summary.files
-    st.markdown("**Per-engine means** — an engine is ranked only when every one of its files is confirmed as a "
-                f"{TARGET_VOICE} voice (set under each file's TTS tab).")
+    summary["ranked"] = summary.higher_pitch_files == summary.files
+    st.markdown(
+        "**Per-engine means** — an engine is ranked only when every successful file has measurable "
+        f"median F0 at or above {FEMALE_VOICE_F0_THRESHOLD_HZ:.0f} Hz."
+    )
+    st.caption("F0 is a rough voice-range heuristic, not a gender test.")
     st.dataframe(summary, hide_index=True, width="stretch", column_config={
         c: st.column_config.NumberColumn(format="%.3f") for c in ("loopback_mean", "utmos_mean", "rtf_mean")
     })
     if not summary.ranked.any():
-        st.info(f"No engine is fully confirmed as a {TARGET_VOICE} voice yet, so no TTS ranking is claimed.")
+        st.info(
+            "No engine has measurable median F0 above the threshold for every successful file, "
+            "so no TTS ranking is claimed."
+        )
     if ok["loopback (%)"].isna().all():
         st.caption("Loopback is empty: choose a loopback judge above to measure intelligibility.")
 

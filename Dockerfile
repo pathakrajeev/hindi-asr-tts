@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     USE_FLAX=0 \
     TRANSFORMERS_NO_TF=1 \
     MFA_ROOT_DIR=/home/appuser/.local/share/MFA \
+    TRITON_CACHE_DIR=/home/appuser/.cache/triton \
     PATH=/opt/mfa/bin:/opt/app-env/bin:${PATH}
 
 WORKDIR /app
@@ -32,8 +33,8 @@ COPY Hindi_Dict_g2g.txt Hindi_All_Acoustic.zip Sanskrit_Dict.txt Sanskrit_Acoust
 COPY .streamlit ./.streamlit
 
 RUN useradd --create-home --uid 1000 appuser \
-    && mkdir -p /home/appuser/.local/share/MFA \
-    && chown -R appuser:appuser /app /home/appuser/.local
+    && mkdir -p /home/appuser/.local/share/MFA /home/appuser/.cache/triton \
+    && chown -R appuser:appuser /app /home/appuser/.local /home/appuser/.cache
 
 USER appuser
 
