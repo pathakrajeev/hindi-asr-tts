@@ -296,7 +296,8 @@ def import_recordings(corpus: Corpus, audio_uploads, transcript_uploads=()) -> d
     if not corpus.stimuli_csv.is_file():
         raise FileNotFoundError(f"{corpus.stimuli_csv} not found. Create the corpus first.")
     known_speakers, known_sentences = set(corpus.speakers()), set(corpus.text_of())
-    audio_items, transcript_items = {}, {}
+    audio_items, transcript_items, transcript_keys = {}, {}, set()
+    verified_stimulus_transcripts = 0
 
     def parse_upload(upload, suffixes, label):
         name = Path(upload.name).name
@@ -346,18 +347,27 @@ def import_recordings(corpus: Corpus, audio_uploads, transcript_uploads=()) -> d
 
     for upload in transcript_uploads:
         name, speaker, item_id, _ = parse_upload(upload, (".txt",), "transcript")
-        if item_id != "passage":
-            raise ValueError(f"{name}: transcripts are accepted only for the separate `speaker__passage.txt` sample.")
-        key = (speaker, "passage")
-        if key in transcript_items:
-            raise ValueError(f"More than one cloning-passage transcript was uploaded for {speaker}.")
+        if item_id != "passage" and item_id not in known_sentences:
+            raise ValueError(f"{name}: unknown stimulus ID {item_id!r}.")
+        key = (speaker, item_id)
+        if key in transcript_keys:
+            raise ValueError(f"More than one transcript was uploaded for {speaker}/{item_id}.")
+        transcript_keys.add(key)
         try:
             text = upload.getvalue().decode("utf-8-sig").strip()
         except UnicodeDecodeError as exc:
             raise ValueError(f"{name}: transcript must be UTF-8 text.") from exc
         if not text:
             raise ValueError(f"{name}: transcript is empty.")
-        transcript_items[key] = (corpus.clone_dir(speaker) / "passage.txt", text)
+        if item_id == "passage":
+            transcript_items[key] = (corpus.clone_dir(speaker) / "passage.txt", text)
+        elif mfa_text(text) != mfa_text(corpus.text_of()[item_id]):
+            raise ValueError(
+                f"{name}: transcript does not match the frozen stimulus text for {item_id}. "
+                "Correct the transcript or remove this optional verification file."
+            )
+        else:
+            verified_stimulus_transcripts += 1
 
     for key, (_, _, is_passage) in audio_items.items():
         if is_passage and key not in transcript_items:
@@ -381,6 +391,7 @@ def import_recordings(corpus: Corpus, audio_uploads, transcript_uploads=()) -> d
     return {
         "stimuli": sum(not is_passage for _, _, is_passage in audio_items.values()),
         "passages": sum(is_passage for _, _, is_passage in audio_items.values()),
+        "verified_transcripts": verified_stimulus_transcripts,
     }
 
 

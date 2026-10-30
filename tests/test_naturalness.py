@@ -392,10 +392,33 @@ def test_recording_import_and_clone_consent(tmp_path=None):
     sample = io.BytesIO()
     sf.write(sample, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
     wav = sample.getvalue()
-    uploads = [SimpleNamespace(name="S01__sent_001.wav", getvalue=lambda: wav)]
     transcript = [SimpleNamespace(name="S01__passage.txt", getvalue=lambda: b"\xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87")]
-    counts = nat.import_recordings(corpus, uploads)
-    assert counts == {"stimuli": 1, "passages": 0}
+    stimulus_text = corpus.text_of()["sent_001"]
+    matching_stimulus_transcript = [
+        SimpleNamespace(name="S01__sent_001.txt", getvalue=lambda: stimulus_text.encode("utf-8"))
+    ]
+    verified_counts = nat.import_recordings(
+        corpus,
+        [SimpleNamespace(name="S01__sent_001.wav", getvalue=lambda: wav)],
+        matching_stimulus_transcript,
+    )
+    assert verified_counts == {"stimuli": 1, "passages": 0, "verified_transcripts": 1}
+
+    wrong_stimulus_transcript = [
+        SimpleNamespace(name="S01__sent_002.txt", getvalue=lambda: "गलत पाठ".encode("utf-8"))
+    ]
+    try:
+        nat.import_recordings(
+            corpus,
+            [SimpleNamespace(name="S01__sent_002.wav", getvalue=lambda: wav)],
+            wrong_stimulus_transcript,
+        )
+    except ValueError as exc:
+        assert "does not match the frozen stimulus text" in str(exc)
+    else:
+        raise AssertionError("an incorrect optional stimulus transcript must be rejected")
+
+    counts = verified_counts
     try:
         nat.import_recordings(corpus, [], transcript)
     except ValueError as exc:
@@ -407,7 +430,7 @@ def test_recording_import_and_clone_consent(tmp_path=None):
         [SimpleNamespace(name="S01__passage.wav", getvalue=lambda: wav)],
         transcript,
     )
-    assert passage_counts == {"stimuli": 0, "passages": 1}
+    assert passage_counts == {"stimuli": 0, "passages": 1, "verified_transcripts": 0}
     try:
         nat.generate(corpus, "clone-indicf5")
     except ValueError as exc:

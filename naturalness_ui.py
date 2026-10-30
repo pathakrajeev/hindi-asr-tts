@@ -85,8 +85,9 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
     with st.expander("Import pilot recordings"):
         st.caption(
             "Upload audio named `S01__sent_001.wav` for human stimulus recordings, "
-            "`S01__passage.wav` for the separate cloning passage, and matching "
-            "`S01__passage.txt` transcript files. Existing files are never overwritten."
+            "with optional matching `S01__sent_001.txt` to verify its transcript. For voice cloning, "
+            "upload `S01__passage.wav` and matching `S01__passage.txt`. Stimulus transcript files "
+            "must match the frozen corpus text; they are checked but not stored. Existing files are never overwritten."
         )
         audio_uploads = st.file_uploader(
             "Human recordings and read-aloud cloning passages",
@@ -95,7 +96,7 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
             key="nat_recordings_upload",
         )
         transcript_uploads = st.file_uploader(
-            "Read-aloud passage transcripts (.txt)",
+            "Optional stimulus checks and read-aloud passage transcripts (.txt)",
             type=["txt"],
             accept_multiple_files=True,
             key="nat_passage_text_upload",
@@ -105,7 +106,8 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
                 counts = nat.import_recordings(corpus, audio_uploads, transcript_uploads or [])
                 st.success(
                     f"Imported {counts['stimuli']} human stimulus recording(s) and "
-                    f"{counts['passages']} cloning passage(s)."
+                    f"{counts['passages']} cloning passage(s); "
+                    f"verified {counts['verified_transcripts']} stimulus transcript(s)."
                 )
             except Exception as exc:
                 st.error(f"Recording import failed: {type(exc).__name__}: {exc}")

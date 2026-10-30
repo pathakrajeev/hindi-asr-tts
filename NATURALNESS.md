@@ -48,8 +48,9 @@ speaker recordings or model checkpoints into the Git repository.
    - `data/naturalness/speakers/S01/stimuli/sent_001.wav`, … one file per stimulus.
    - Use the same microphone and room throughout, 16 kHz or higher, mono, no clipping.
    The app can import files named `S01__sent_001.wav`, `S01__passage.wav`, and
-   `S01__passage.txt`. Passage audio and transcript must be uploaded together. Existing files are
-   never overwritten.
+   `S01__passage.txt`. Optionally include `S01__sent_001.txt` to verify that the recording transcript
+   matches the frozen stimulus; this check file is not stored. Passage audio and transcript must be
+   uploaded together. Existing files are never overwritten.
 4. Check the corpus. The check exits with an error if the passage leaks stimulus text, meaning a
    run of 4+ consecutive words is shared with a stimulus, or if a passage audio file is a copy of a
    stimulus recording.
