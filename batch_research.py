@@ -6,9 +6,6 @@ models and pronunciation dictionaries. Wav2Vec2 embeddings are optional.
 import io
 import json
 import os
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 
 import librosa
@@ -83,45 +80,27 @@ def similarity_rows(items):
 
 
 def run_mfa(audio, sr, transcript, dictionary, acoustic, command="mfa"):
-    """Align reference words using an installed MFA CLI. Returns TextGrid intervals."""
-    import textgrid
-    executable = shutil.which(command)
-    if not executable:
-        raise RuntimeError(
-            "MFA command not found on PATH. Rebuild the Space using this project's Dockerfile "
-            "to install Montreal Forced Aligner."
-        )
+    """Align reference words using an installed MFA CLI. Returns word intervals.
+
+    The IndicMFA dictionaries list akshara units only, so whole words would align as OOV (spn);
+    naturalness.align_one builds a word-to-akshara lexicon from the acoustic model's phone set."""
+    import naturalness
     if not dictionary or not acoustic:
         raise ValueError("An MFA pronunciation dictionary and compatible acoustic model are required.")
-    with tempfile.TemporaryDirectory(prefix="speech_mfa_") as folder:
-        root = Path(folder)
-        corpus, output = root / "corpus", root / "aligned"
-        corpus.mkdir()
-        output.mkdir()
-        sf.write(corpus / "sample.wav", audio, sr, subtype="PCM_16")
-        # Punctuation-free words, so tokens like "है।" do not become dictionary misses.
-        (corpus / "sample.lab").write_text(normalize_reference_text(transcript), encoding="utf-8")
-        cmd = [executable, "align", str(corpus), dictionary, acoustic, str(output), "--clean"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode:
-            raise RuntimeError((proc.stderr or proc.stdout)[-900:])
-        path = output / "sample.TextGrid"
-        if not path.exists():
-            matches = list(output.rglob("*.TextGrid"))
-            if not matches:
-                raise RuntimeError("MFA finished without producing a TextGrid.")
-            path = matches[0]
-        grid = textgrid.TextGrid.fromFile(str(path))
-        tier = next((t for t in grid.tiers if t.name.lower() in ("words", "word")), None)
-        if tier is None:
-            raise RuntimeError("No words tier in MFA output.")
-        return [{"word": x.mark, "start_s": float(x.minTime), "end_s": float(x.maxTime),
-                 "duration_s": float(x.maxTime - x.minTime)} for x in tier if x.mark.strip()]
+    words = naturalness.align_one(audio, sr, transcript, acoustic=acoustic, dictionary=dictionary,
+                                  command=command, jobs=1, log=lambda *_: None)
+    return [{"word": w["word"], "start_s": w["start_s"], "end_s": w["end_s"], "duration_s": w["dur_s"],
+             "pause_after_s": w["pause_after_s"], "oov": w["oov"]} for w in words]
 
 
 def render_batch_tab():
     st.subheader("Batch research · multi-file analysis")
-    st.caption("Upload audio and matching transcript files to prefill references automatically. Compare ASR/TTS, acoustic embeddings and optional IndicMFA alignment.")
+    st.caption(
+        "Upload audio and matching transcript files to prefill references automatically. "
+        "IndicLID suggests Hindi or Sanskrit from Devanagari transcripts; the existing text rules "
+        "detect Hindi-English code-mixing. Its model downloads on first use (~161 MB). "
+        "Review or override the suggestion before running models."
+    )
     uploads = st.file_uploader("Audio recordings", type=AUDIO_EXTENSIONS, accept_multiple_files=True, key="batch_audio")
     reference_files = st.file_uploader(
         "Reference transcripts (.txt, UTF-8; automatically matched by filename)",
@@ -150,17 +129,18 @@ def render_batch_tab():
                     return
                 ref_map[key] = text
         metadata_rows = []
-        for upload in uploads:
-            reference = ref_map.get(Path(upload.name).stem.casefold(), "")
-            language, evidence = guess_language(reference)
-            metadata_rows.append({
-                "filename": upload.name,
-                "reference": reference,
-                "language": language,
-                "language evidence": evidence,
-                "speaker": Path(upload.name).stem,
-                "provenance": "unknown",
-            })
+        with st.spinner("Suggesting transcript languages (first IndicLID use downloads its model)…"):
+            for upload in uploads:
+                reference = ref_map.get(Path(upload.name).stem.casefold(), "")
+                language, evidence = guess_language(reference)
+                metadata_rows.append({
+                    "filename": upload.name,
+                    "reference": reference,
+                    "language": language,
+                    "language evidence": evidence,
+                    "speaker": Path(upload.name).stem,
+                    "provenance": "unknown",
+                })
         metadata = pd.DataFrame(metadata_rows)
         matched_count = sum(bool(normalize_reference_text(row["reference"])) for row in metadata_rows)
         if matched_count:

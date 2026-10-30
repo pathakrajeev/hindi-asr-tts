@@ -30,6 +30,7 @@ import hashlib  # noqa: E402
 from research import render_research_tab  # noqa: E402
 from batch_research import render_batch_tab  # noqa: E402
 from deepfake import render_synthetic_mode  # noqa: E402
+from naturalness_ui import render_naturalness_mode  # noqa: E402
 from speech_core import (
     EmptyTranscriptError,
     LIVE_ASR_WINDOW_SECONDS,
@@ -388,6 +389,17 @@ def render_mode_overview(mode: str) -> None:
 
             Scores are research evidence, not proof that a recording is genuine or fake.
             """)
+        elif mode == "Naturalness":
+            st.markdown("""
+            **Naturalness pipeline** (protocol in NATURALNESS.md)
+            1. Fixed train/dev/test split of the stimuli by sentence; a separate read-aloud passage per
+               speaker is the only audio used for voice cloning (leakage is checked and blocks cloning).
+            2. MFA word alignment of human and machine speech with identical settings.
+            3. Word-level diff (human − machine duration, pauses) trains a duration-correction layer,
+               chosen on dev and applied by pitch-preserving per-word time-stretching.
+            4. Test-set evaluation (timing, F0, speaker similarity, UTMOS, detector) and a blind
+               human-vs-machine listening test, where 50% correct means indistinguishable.
+            """)
         elif mode in ("Research", "Batch Research"):
             st.markdown("""
             **Research pipeline**
@@ -412,7 +424,7 @@ def render_mode_overview(mode: str) -> None:
 st.title("🗣️ Hindi ASR → TTS Pipeline")
 mode = st.radio(
     "Choose a workflow",
-    ["Research", "Live", "Batch Research", "Synthetic speech"],
+    ["Research", "Live", "Batch Research", "Synthetic speech", "Naturalness"],
     horizontal=True,
     key="app_mode",
 )
@@ -432,5 +444,7 @@ elif mode == "Research":
     render_research_tab()
 elif mode == "Batch Research":
     render_batch_tab()
+elif mode == "Naturalness":
+    render_naturalness_mode()
 else:
     render_synthetic_mode()

@@ -22,6 +22,7 @@ requests>=2.31
 numpy>=1.26
 python-dotenv>=1.0,<2
 scikit-learn
+fasttext-wheel==0.9.2
 
 # Optional MFA TextGrid parsing (MFA executable/model assets installed separately)
 textgrid>=1.6

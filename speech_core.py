@@ -1,10 +1,13 @@
 import base64
 import io
+import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 import unicodedata
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -38,6 +41,14 @@ PRIMARY_LABEL = {"wer": "Normalized WER", "wer_script_tolerant": "Script-toleran
 
 
 # ---------------------------------------------------------------- language suggestion from text
+INDICLID_FTN_URL = (
+    "https://github.com/AI4Bharat/IndicLID/releases/download/v1.0/indiclid-ftn.zip"
+)
+INDICLID_MIN_CONFIDENCE = 0.65
+INDICLID_MIN_DEVANAGARI_WORDS = 3
+logger = logging.getLogger(__name__)
+
+
 # Common English words as Hindi speakers write them in Devanagari. A suggestion aid only:
 # nativized words (स्कूल, बस, फोन) are common in plain Hindi, so code-mixing needs several of them.
 ENGLISH_IN_DEVANAGARI = set("""
@@ -77,30 +88,77 @@ def _loanword_key(word: str) -> str:
 _LOANWORD_KEYS = None
 
 
-def guess_language(text: str) -> tuple[str, str]:
-    """Suggest hi / hi-en / sa from a reference transcript, with the evidence used.
+@st.cache_resource(show_spinner=False)
+def _load_indiclid_native():
+    import fasttext
 
-    A suggestion for the user to confirm, not language identification:
-      sa    - long words with Sanskrit endings and almost no Hindi function words;
-      hi-en - Latin-script words, or English words written in Devanagari (3+ and 10%+ of words);
-      hi    - otherwise.
-    """
+    cache_dir = Path.home() / ".cache" / "hindi-asr-tts" / "indiclid-ftn"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    model_path = cache_dir / "model_baseline_roman.bin"
+    if not model_path.is_file():
+        archive_path = None
+        model_temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=cache_dir, prefix="indiclid-", suffix=".zip", delete=False
+            ) as archive_file:
+                archive_path = Path(archive_file.name)
+            with tempfile.NamedTemporaryFile(
+                dir=cache_dir, prefix="indiclid-model-", suffix=".bin", delete=False
+            ) as model_file:
+                model_temp_path = Path(model_file.name)
+            with requests.get(INDICLID_FTN_URL, stream=True, timeout=(20, 120)) as response:
+                response.raise_for_status()
+                with archive_path.open("wb") as downloaded:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            downloaded.write(chunk)
+            with zipfile.ZipFile(archive_path) as archive:
+                model_members = [
+                    member for member in archive.infolist()
+                    if Path(member.filename).name == "model_baseline_roman.bin"
+                    and not member.is_dir()
+                ]
+                if len(model_members) != 1:
+                    raise RuntimeError(
+                        "IndicLID model archive did not contain exactly one "
+                        "model_baseline_roman.bin file."
+                    )
+                with archive.open(model_members[0]) as source, model_temp_path.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+            if model_temp_path.stat().st_size == 0:
+                raise RuntimeError("Downloaded IndicLID model file is empty.")
+            model_temp_path.replace(model_path)
+        finally:
+            if archive_path is not None:
+                archive_path.unlink(missing_ok=True)
+            if model_temp_path is not None:
+                model_temp_path.unlink(missing_ok=True)
+    return fasttext.load_model(str(model_path))
+
+
+def _guess_language_rules(text: str) -> tuple[str, str]:
+    """Apply the existing Sanskrit and Hindi-English text heuristics."""
     global _LOANWORD_KEYS
     import textnorm
 
     words = (text or "").split()
     if not words:
         return "hi", "no reference text"
-    latin, latin_share = textnorm.latin_share(text)
+    latin, _ = textnorm.latin_share(text)
     deva = _deva_words(text)
     if deva:
         function_rate = sum(w in _HINDI_FUNCTION_WORDS for w in deva) / len(deva)
         avg_len = sum(len(w) for w in deva) / len(deva)
         ending_rate = sum(bool(_SANSKRIT_ENDINGS.search(w)) for w in deva) / len(deva)
         notebook_score = textnorm.sanskrit_likelihood(text)["sanskrit_score"]
-        if len(deva) >= 5 and function_rate < 0.03 and (avg_len >= 6.0 or ending_rate >= 0.4 or notebook_score >= 0.5):
-            return "sa", (f"Sanskrit cues: {function_rate:.0%} Hindi function words, average word "
-                          f"{avg_len:.1f} letters, {ending_rate:.0%} Sanskrit-style endings")
+        if len(deva) >= 5 and function_rate < 0.03 and (
+            avg_len >= 6.0 or ending_rate >= 0.4 or notebook_score >= 0.5
+        ):
+            return "sa", (
+                f"Sanskrit cues: {function_rate:.0%} Hindi function words, average word "
+                f"{avg_len:.1f} letters, {ending_rate:.0%} Sanskrit-style endings"
+            )
     if _LOANWORD_KEYS is None:
         _LOANWORD_KEYS = {_loanword_key(w) for w in ENGLISH_IN_DEVANAGARI}
     english_deva = [w for w in deva if _loanword_key(w) in _LOANWORD_KEYS]
@@ -112,8 +170,47 @@ def guess_language(text: str) -> tuple[str, str]:
         detail = f"{english} of {len(words)} words are English"
         detail += f" (Devanagari: {shown})" if english_deva else " (Latin script)"
         return "hi-en", detail
-    return "hi", (f"Hindi; {english} English word(s) found, below the code-mix threshold" if english
-                  else "Hindi; no Sanskrit or code-mix cues")
+    return "hi", (
+        f"Hindi; {english} English word(s) found, below the code-mix threshold"
+        if english else "Hindi; no Sanskrit or code-mix cues"
+    )
+
+
+def guess_language(text: str) -> tuple[str, str]:
+    """Suggest hi / hi-en / sa using IndicLID plus the existing text heuristics.
+
+    IndicLID is used for sufficiently long Devanagari text. The existing code-mix
+    rule takes precedence, and low-confidence or unsupported predictions fall back
+    to the existing Sanskrit/Hindi heuristics.
+    """
+    words = (text or "").split()
+    if not words:
+        return "hi", "no reference text"
+    deva = _deva_words(text)
+    heuristic_language, heuristic_evidence = _guess_language_rules(text)
+    if heuristic_language == "hi-en" or len(deva) < INDICLID_MIN_DEVANAGARI_WORDS:
+        return heuristic_language, heuristic_evidence
+    try:
+        model = _load_indiclid_native()
+        labels, scores = model.predict(" ".join(deva), k=1)
+        label = labels[0].removeprefix("__label__")
+        confidence = float(scores[0])
+    except Exception as exc:
+        logger.exception("IndicLID language prediction failed")
+        return heuristic_language, (
+            f"{heuristic_evidence}; IndicLID unavailable ({type(exc).__name__}); "
+            "using text-rule suggestion"
+        )
+    if confidence >= INDICLID_MIN_CONFIDENCE:
+        if label == "hin_Deva":
+            return "hi", f"IndicLID predicts Hindi (confidence {confidence:.0%})"
+        if label == "san_Deva":
+            return "sa", f"IndicLID predicts Sanskrit (confidence {confidence:.0%})"
+    fallback = (
+        f"{heuristic_evidence}; IndicLID predicts {label} ({confidence:.0%}), "
+        "so using text-rule suggestion"
+    )
+    return heuristic_language, fallback
 
 
 class EmptyTranscriptError(RuntimeError):

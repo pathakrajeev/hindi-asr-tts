@@ -6,6 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     TRANSFORMERS_NO_TF=1 \
     MFA_ROOT_DIR=/home/appuser/.local/share/MFA \
     TRITON_CACHE_DIR=/home/appuser/.cache/triton \
+    NATURALNESS_ROOT=/data/naturalness \
     PATH=/opt/mfa/bin:/opt/app-env/bin:${PATH}
 
 WORKDIR /app
@@ -28,13 +29,14 @@ RUN mamba create -y -p /opt/mfa -c conda-forge python=3.11 montreal-forced-align
 COPY requirements.txt ./
 RUN /opt/app-env/bin/pip install --no-cache-dir -r requirements.txt
 
-COPY app.py research.py speech_core.py batch_research.py deepfake.py textnorm.py stats.py ./
+COPY app.py research.py speech_core.py batch_research.py deepfake.py textnorm.py stats.py \
+     naturalness.py naturalness_cli.py naturalness_ui.py voice_clone.py mms_finetune.py ./
 COPY Hindi_Dict_g2g.txt Hindi_All_Acoustic.zip Sanskrit_Dict.txt Sanskrit_Acoustic_Model.zip ./
 COPY .streamlit ./.streamlit
 
 RUN useradd --create-home --uid 1000 appuser \
-    && mkdir -p /home/appuser/.local/share/MFA /home/appuser/.cache/triton \
-    && chown -R appuser:appuser /app /home/appuser/.local /home/appuser/.cache
+    && mkdir -p /home/appuser/.local/share/MFA /home/appuser/.cache/triton /data/naturalness \
+    && chown -R appuser:appuser /app /home/appuser/.local /home/appuser/.cache /data
 
 USER appuser
 

@@ -5,3 +5,4 @@ backup
 .env
 .streamlit/secrets.toml
 *.pyc
+data
