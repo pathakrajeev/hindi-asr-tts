@@ -118,6 +118,10 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
     systems = corpus.systems()
     st.markdown("#### Steps")
     st.caption("Same order as NATURALNESS.md. Long steps (generation, MFA) are faster from the CLI.")
+    import torch
+
+    device_options = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+    device = st.selectbox("Local model device", device_options, key="nat_device")
 
     with st.container(border=True):
         st.markdown("**1 · Generate machine speech**")
@@ -138,7 +142,9 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
         ):
             _run(
                 f"Generating {system}",
-                lambda log: nat.generate(corpus, system, speaker_consent=speaker_consent, log=log),
+                lambda log: nat.generate(
+                    corpus, system, device=device, speaker_consent=speaker_consent, log=log,
+                ),
             )
 
     with st.container(border=True):
@@ -248,6 +254,7 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
                     corpus,
                     epochs=int(epochs),
                     learning_rate=float(learning_rate),
+                    device=device,
                     log=log,
                 ),
             )
