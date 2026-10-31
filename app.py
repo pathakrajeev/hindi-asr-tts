@@ -378,29 +378,19 @@ def render_mode_overview(mode: str) -> None:
             Live mode does not require a reference transcript, so it does not report
             reference-based WER or CER.
             """)
-        elif mode == "Synthetic speech":
+        elif mode == "Batch Research":
             st.markdown("""
-            **Synthetic speech (deepfake) detection**
-            1. *Check a file*: score any clip with a zero-shot Indic detector and, once trained, your own detector.
-            2. *Build dataset*: add the last Batch Research run (inputs = real, TTS outputs = synthetic) and any
-               labelled files; every clip gets the same loudness and MP3 codec treatment.
-            3. *Train & evaluate*: WavLM embeddings + logistic regression, tested on unseen speakers and on
-               TTS engines left out of training (AUC, EER, Brier).
-
-            Scores are research evidence, not proof that a recording is genuine or fake.
+            **One batch workflow, three stages** (switch with the selector below)
+            1. *Batch run*: multi-file ASR/TTS comparison with corpus WER/CER and 95% confidence intervals.
+            2. *Synthetic speech detection*: add the last batch run (inputs = real, TTS outputs = synthetic),
+               train a WavLM + logistic-regression detector, and test it on unseen speakers and TTS engines.
+               Scores are research evidence, not proof that a recording is genuine or fake.
+            3. *Naturalness* (protocol in NATURALNESS.md): fixed train/dev/test split by sentence; MFA word
+               alignment of human and machine speech; human − machine duration diff drives a duration
+               correction or MMS duration-predictor fine-tune chosen on dev; held-out test evaluation and
+               a blind listening test, where 50% correct means indistinguishable.
             """)
-        elif mode == "Naturalness":
-            st.markdown("""
-            **Naturalness pipeline** (protocol in NATURALNESS.md)
-            1. Fixed train/dev/test split of the stimuli by sentence; a separate read-aloud passage per
-               speaker is the only audio used for voice cloning (leakage is checked and blocks cloning).
-            2. MFA word alignment of human and machine speech with identical settings.
-            3. Word-level diff (human − machine duration, pauses) trains a duration-correction layer,
-               chosen on dev and applied by pitch-preserving per-word time-stretching.
-            4. Test-set evaluation (timing, F0, speaker similarity, UTMOS, detector) and a blind
-               human-vs-machine listening test, where 50% correct means indistinguishable.
-            """)
-        elif mode in ("Research", "Batch Research"):
+        elif mode == "Research":
             st.markdown("""
             **Research pipeline**
             1. Provide a golden-reference transcript and record or upload audio
@@ -424,11 +414,17 @@ def render_mode_overview(mode: str) -> None:
 st.title("🗣️ Hindi ASR → TTS Pipeline")
 mode = st.radio(
     "Choose a workflow",
-    ["Research", "Live", "Batch Research", "Synthetic speech", "Naturalness"],
+    ["Research", "Live", "Batch Research"],
     horizontal=True,
     key="app_mode",
 )
 render_mode_overview(mode)
+
+BATCH_STAGES = {
+    "batch": "1 · Batch run",
+    "synthetic": "2 · Synthetic speech detection",
+    "naturalness": "3 · Naturalness",
+}
 
 # Live always uses Koyal (gated, HF_TOKEN) and Bulbul (SARVAM_API_KEY). The other modes warn
 # about missing secrets only for the models actually selected.
@@ -442,9 +438,14 @@ if mode == "Live":
     render_live_tab()
 elif mode == "Research":
     render_research_tab()
-elif mode == "Batch Research":
-    render_batch_tab()
-elif mode == "Naturalness":
-    render_naturalness_mode()
 else:
-    render_synthetic_mode()
+    stage = st.segmented_control(
+        "Batch research stage", list(BATCH_STAGES), format_func=BATCH_STAGES.get,
+        default="batch", key="batch_stage", label_visibility="collapsed",
+    ) or "batch"
+    if stage == "batch":
+        render_batch_tab()
+    elif stage == "synthetic":
+        render_synthetic_mode()
+    else:
+        render_naturalness_mode()

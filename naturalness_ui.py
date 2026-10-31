@@ -34,6 +34,21 @@ def _status_table(corpus: nat.Corpus) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _has_analysis_artifacts(corpus: nat.Corpus) -> bool:
+    if corpus.durations_csv.is_file() or corpus.pairs_csv.is_file():
+        return True
+    return any(
+        folder.is_dir() and any(path.is_file() for path in folder.rglob("*"))
+        for folder in (
+            corpus.root / "generated",
+            corpus.root / "alignments",
+            corpus.root / "models",
+            corpus.root / "eval",
+            corpus.root / "speakers",
+        )
+    )
+
+
 def _run(label: str, fn):
     """Run one pipeline step with its log lines streamed into a status box."""
     with st.status(label, expanded=True) as status:
@@ -53,6 +68,207 @@ def _run(label: str, fn):
             return None
 
 
+GUIDED_STEPS = {
+    1: "Recordings",
+    2: "Baseline",
+    3: "Improve timing",
+    4: "Evaluate",
+}
+BASELINE = "mms-tts-hin"
+FINE_TUNED = "mms-tts-hin-ft"
+
+
+def _count(corpus: nat.Corpus, source: str, grids: bool = False) -> tuple[int, int]:
+    ids = list(corpus.text_of())
+    total = len(ids) * len(corpus.speakers())
+    found = 0
+    for speaker in corpus.speakers():
+        for sid in ids:
+            found += corpus.textgrid(source, speaker, sid).is_file() if grids else corpus.audio(source, speaker, sid) is not None
+    return found, total
+
+
+def _systems_with_pairs(corpus: nat.Corpus, split: str | None = None) -> set[str]:
+    if not corpus.pairs_csv.is_file():
+        return set()
+    try:
+        pairs = nat.load_pairs(corpus)
+    except Exception:
+        return set()
+    if pairs.empty:
+        return set()
+    if split:
+        pairs = pairs[pairs.split == split]
+    return set(pairs.system)
+
+
+def _guided_progress(corpus: nat.Corpus) -> dict[int, bool]:
+    human_audio, total = _count(corpus, nat.HUMAN)
+    return {
+        1: total > 0 and human_audio == total,
+        2: BASELINE in _systems_with_pairs(corpus, "test"),
+        3: bool(_systems_with_pairs(corpus, "test") - {BASELINE}),
+        4: (corpus.root / "eval").is_dir() and any(p.is_file() for p in (corpus.root / "eval").rglob("*")),
+    }
+
+
+def _align_and_rebuild(corpus: nat.Corpus, systems: list[str], lexicon: str, force: bool, log) -> dict:
+    result = nat.align_corpus(corpus, [nat.HUMAN, *systems], force=force, word_lexicon=lexicon or None, log=log)
+    durations = nat.build_durations(corpus)
+    pairs = nat.build_pairs(corpus, durations)
+    log(f"{len(durations)} aligned words; {len(pairs)} human/machine word pairs")
+    if result.get("oov_words"):
+        log(f"{len(result['oov_words'])} out-of-vocabulary word(s): " + ", ".join(result["oov_words"][:30]))
+    return result
+
+
+def _render_recording_import(corpus: nat.Corpus, expander: bool = False) -> None:
+    if expander:
+        with st.expander("Import pilot recordings"):
+            _render_recording_import(corpus)
+        return
+    st.caption(
+        "Upload audio named `S01__sent_001.wav` for human stimulus recordings, "
+        "with optional matching `S01__sent_001.txt` to verify its transcript. For voice cloning, "
+        "upload `S01__passage.wav` and matching `S01__passage.txt`. Stimulus transcript files "
+        "must match the frozen corpus text; they are checked but not stored. Existing files are never overwritten."
+    )
+    audio_uploads = st.file_uploader(
+        "Human recordings and read-aloud cloning passages",
+        type=[suffix.lstrip(".") for suffix in nat.AUDIO_SUFFIXES],
+        accept_multiple_files=True,
+        key="nat_recordings_upload",
+    )
+    transcript_uploads = st.file_uploader(
+        "Optional stimulus checks and read-aloud passage transcripts (.txt)",
+        type=["txt"],
+        accept_multiple_files=True,
+        key="nat_passage_text_upload",
+    )
+    if st.button("Import recordings", key="nat_import_recordings", disabled=not audio_uploads):
+        try:
+            counts = nat.import_recordings(corpus, audio_uploads, transcript_uploads or [])
+            st.success(
+                f"Imported {counts['stimuli']} human stimulus recording(s) and "
+                f"{counts['passages']} cloning passage(s); "
+                f"verified {counts['verified_transcripts']} stimulus transcript(s)."
+            )
+        except Exception as exc:
+            st.error(f"Recording import failed: {type(exc).__name__}: {exc}")
+
+
+def _render_guided(corpus: nat.Corpus) -> None:
+    import torch
+
+    st.session_state.setdefault("nat_step", 1)
+    step = int(st.session_state["nat_step"])
+    header = st.container()
+    device_options = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+
+    with st.container(border=True):
+        st.markdown(f"### Step {step} of {len(GUIDED_STEPS)} · {GUIDED_STEPS[step]}")
+        if step == 1:
+            st.caption("Import your human recordings. Each must be named `S01__sent_001.wav`, matching a stimulus ID.")
+            _render_recording_import(corpus)
+            not_wav = nat.non_wav_recordings(corpus)
+            if not_wav and st.button(f"Convert {len(not_wav)} recording(s) to WAV", key="nat_convert_wav",
+                                     icon=":material/audio_file:"):
+                if _run("Converting recordings to WAV", lambda log: nat.convert_recordings_to_wav(corpus, log=log)):
+                    st.rerun()
+            found, total = _count(corpus, nat.HUMAN)
+            st.metric("Human recordings", f"{found} / {total}")
+            if total and found < total:
+                st.info("Every stimulus needs a human recording before the baseline can be compared.")
+        elif step == 2:
+            st.caption(f"Generates `{BASELINE}` speech for every stimulus, aligns it and the human audio with "
+                       "MFA, and builds the word-pair table, all in one run.")
+            device = st.selectbox("Local model device", device_options, key="nat_device")
+            lexicon = st.text_input("Optional word lexicon path", key="nat_word_lexicon",
+                                    help="UTF-8 lines: word<TAB>phone phone. Only needed for out-of-vocabulary words.").strip()
+            redo = st.toggle("Redo files that already exist", key="nat_redo_base")
+            if st.button("Run baseline: generate → align → compare", type="primary", key="nat_run_base",
+                         icon=":material/play_arrow:"):
+                def run_base(log):
+                    nat.generate(corpus, BASELINE, device=device, force=redo, log=log)
+                    return _align_and_rebuild(corpus, [BASELINE], lexicon, redo, log)
+                _run("Baseline pipeline", run_base)
+            if corpus.durations_csv.is_file():
+                st.dataframe(nat.alignment_coverage(corpus), hide_index=True,
+                             alt="Alignment and word coverage per source")
+        elif step == 3:
+            st.caption("Pick one way to improve machine timing. Each runs end to end and is evaluated on the "
+                       "untouched test split.")
+            method = st.segmented_control(
+                "Method", ["finetune", "layer"], default="finetune", key="nat_method",
+                format_func={"finetune": "Fine-tune MMS duration predictor",
+                             "layer": "Duration-correction layer"}.get,
+            ) or "finetune"
+            device = st.selectbox("Local model device", device_options, key="nat_device_ft")
+            lexicon = st.session_state.get("nat_word_lexicon", "").strip()
+            if method == "finetune":
+                st.warning("MMS Hindi is licensed CC-BY-NC 4.0; use the fine-tuned model only as that license allows.")
+                left, right = st.columns(2)
+                epochs = left.number_input("Maximum epochs", 1, 200, 50, key="nat_mms_ft_epochs")
+                lr = right.number_input("Learning rate", 0.000001, 0.001, 0.00001, 0.000001,
+                                        format="%.6f", key="nat_mms_ft_lr")
+                if st.button("Run: fine-tune → generate → align → compare", type="primary", key="nat_run_ft",
+                             icon=":material/model_training:", disabled=not _systems_with_pairs(corpus)):
+                    def run_ft(log):
+                        import mms_finetune
+                        mms_finetune.fine_tune_duration_predictor(
+                            corpus, epochs=int(epochs), learning_rate=float(lr), device=device, log=log)
+                        nat.generate(corpus, FINE_TUNED, device=device, force=True, log=log)
+                        return _align_and_rebuild(corpus, [BASELINE, FINE_TUNED], lexicon, False, log)
+                    _run("Fine-tuning pipeline", run_ft)
+            else:
+                st.caption("Learns per-word duration and pause corrections on train, picks the best on dev, and "
+                           "time-stretches the baseline audio.")
+                if st.button("Run: train → apply → align → compare", type="primary", key="nat_run_layer",
+                             icon=":material/auto_fix_high:", disabled=not _systems_with_pairs(corpus)):
+                    def run_layer(log):
+                        model, _report = nat.train_duration_model(nat.load_pairs(corpus, BASELINE))
+                        model.save(corpus.model_path(BASELINE), {"system": BASELINE, "word_model": model.word_kind,
+                                                                 "pause_model": model.pause_kind, **model.trained_on})
+                        log(f"selected word={model.word_kind}, pause={model.pause_kind}")
+                        nat.correct_system(corpus, BASELINE, log=log)
+                        return _align_and_rebuild(corpus, [BASELINE, f"{BASELINE}+dur"], lexicon, False, log)
+                    _run("Correction-layer pipeline", run_layer)
+        else:
+            valid = sorted(_systems_with_pairs(corpus, "test"))
+            missing = [s for s in corpus.systems() if s not in valid]
+            if missing:
+                st.info("Not evaluated (no valid aligned test pairs): " + ", ".join(missing))
+            chosen = st.multiselect("Systems to evaluate", valid, default=valid, key="nat_eval_systems")
+            acoustic = st.toggle("Acoustic metrics (F0, speaker similarity, UTMOS, detector; downloads models)",
+                                 key="nat_eval_acoustic")
+            left, right = st.columns(2)
+            if left.button("Evaluate on test", type="primary", key="nat_eval", disabled=not chosen,
+                           icon=":material/analytics:", width="stretch"):
+                _run("Evaluating", lambda log: nat.evaluate(corpus, chosen, "test", acoustic=acoustic, log=log))
+            if right.button("Build listening kit", key="nat_kit", disabled=not chosen,
+                            icon=":material/headphones:", width="stretch"):
+                _run("Building listening test", lambda log: log(f"{len(nat.build_listening_test(corpus, chosen))} trials"))
+            st.caption("Open the Results and Listening test sections above to view the outcome.")
+
+    done = _guided_progress(corpus)
+    with header:
+        st.markdown("  →  ".join(
+            f"{'✅' if done[i] else ('▶️' if i == step else '○')} {i} {label}" for i, label in GUIDED_STEPS.items()
+        ))
+    back, forward, skip = st.columns(3)
+    if back.button("Back", key="nat_back", disabled=step == 1, icon=":material/arrow_back:", width="stretch"):
+        st.session_state["nat_step"] = step - 1
+        st.rerun()
+    if forward.button("Next", key="nat_next", disabled=step == len(GUIDED_STEPS) or not done[step],
+                      type="primary", icon=":material/arrow_forward:", width="stretch"):
+        st.session_state["nat_step"] = step + 1
+        st.rerun()
+    if step == 3 and skip.button("Skip to evaluation", key="nat_skip", width="stretch",
+                                 disabled=not done[2]):
+        st.session_state["nat_step"] = 4
+        st.rerun()
+
+
 def _render_pipeline(corpus: nat.Corpus) -> None:
     if not corpus.stimuli_csv.is_file():
         st.info("Create the corpus first, then add recordings to the folders it creates.",
@@ -68,6 +284,11 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
         if submitted:
             try:
                 sentences = [line.strip() for line in sentences_text.splitlines() if line.strip()]
+                if len({nat.mfa_text(sentence) for sentence in sentences}) < 3:
+                    raise ValueError(
+                        "Enter at least three unique stimulus sentences, one per line, to create "
+                        "non-empty train/dev/test splits."
+                    )
                 speakers = [value.strip() for value in speaker_ids.split(",") if value.strip()]
                 if not speakers:
                     raise ValueError("Enter at least one speaker ID.")
@@ -82,37 +303,81 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
                 st.error(f"Could not create corpus: {type(exc).__name__}: {exc}")
         return
 
-    with st.expander("Import pilot recordings"):
-        st.caption(
-            "Upload audio named `S01__sent_001.wav` for human stimulus recordings, "
-            "with optional matching `S01__sent_001.txt` to verify its transcript. For voice cloning, "
-            "upload `S01__passage.wav` and matching `S01__passage.txt`. Stimulus transcript files "
-            "must match the frozen corpus text; they are checked but not stored. Existing files are never overwritten."
+    if not corpus.splits_csv.is_file():
+        st.warning(
+            "This corpus has stimuli but no `splits.csv`. Training and evaluation require fixed "
+            "train/dev/test assignments."
         )
-        audio_uploads = st.file_uploader(
-            "Human recordings and read-aloud cloning passages",
-            type=[suffix.lstrip(".") for suffix in nat.AUDIO_SUFFIXES],
-            accept_multiple_files=True,
-            key="nat_recordings_upload",
-        )
-        transcript_uploads = st.file_uploader(
-            "Optional stimulus checks and read-aloud passage transcripts (.txt)",
-            type=["txt"],
-            accept_multiple_files=True,
-            key="nat_passage_text_upload",
-        )
-        if st.button("Import recordings", key="nat_import_recordings", disabled=not audio_uploads):
-            try:
-                counts = nat.import_recordings(corpus, audio_uploads, transcript_uploads or [])
-                st.success(
-                    f"Imported {counts['stimuli']} human stimulus recording(s) and "
-                    f"{counts['passages']} cloning passage(s); "
-                    f"verified {counts['verified_transcripts']} stimulus transcript(s)."
+        if _has_analysis_artifacts(corpus):
+            st.error(
+                "Generated audio, alignments, models, or evaluation files already exist. Creating "
+                "splits now could introduce test-set leakage. Restore this corpus's original splits.csv "
+                "from backup, or start a fresh corpus."
+            )
+        elif len(corpus.stimuli()) < 3:
+            st.info(
+                f"This incomplete corpus has {len(corpus.stimuli())} unique stimulus sentence(s). "
+                "Add enough additional unique sentences to reach at least three; existing sentence IDs "
+                "and wording will be preserved."
+            )
+            with st.form("nat_add_missing_stimuli"):
+                additional_text = st.text_area(
+                    "Additional stimuli (one new sentence per line)",
+                    help="Add at least two unique sentences if the corpus currently has only one.",
+                    height=140,
                 )
+                submitted = st.form_submit_button("Add stimuli and create fixed splits", type="primary")
+            if submitted:
+                try:
+                    additions = [line.strip() for line in additional_text.splitlines() if line.strip()]
+                    current_texts = corpus.stimuli().text.tolist()
+                    combined = [*current_texts, *additions]
+                    if len({nat.mfa_text(sentence) for sentence in combined}) < 3:
+                        raise ValueError(
+                            "The combined corpus must contain at least three unique sentences. "
+                            "Add more distinct sentences and try again."
+                        )
+                    updated = nat.append_stimuli(corpus, additions)
+                    split = nat.make_splits(corpus)
+                    st.success(
+                        f"Added {len(updated) - len(current_texts)} stimulus sentence(s) and created "
+                        f"fixed splits: {split.split.value_counts().to_dict()}."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not complete the corpus: {type(exc).__name__}: {exc}")
+        elif st.button(
+            "Create fixed train/dev/test splits",
+            key="nat_recover_splits",
+            icon=":material/splitscreen:",
+        ):
+            try:
+                split = nat.make_splits(corpus)
+                st.success(f"Created fixed splits: {split.split.value_counts().to_dict()}.")
+                st.rerun()
             except Exception as exc:
-                st.error(f"Recording import failed: {type(exc).__name__}: {exc}")
+                st.error(f"Could not create splits: {type(exc).__name__}: {exc}")
+        return
+
+    if not st.toggle("Show all individual steps (advanced)", key="nat_advanced"):
+        for issue in nat.validate_corpus(corpus):
+            if issue["level"] != "ok":
+                {"error": st.error, "warning": st.warning}[issue["level"]](issue["message"])
+        _render_guided(corpus)
+        return
+
+    _render_recording_import(corpus, expander=True)
 
     st.markdown("#### Corpus check")
+    not_wav = nat.non_wav_recordings(corpus)
+    if not_wav and st.button(f"Convert {len(not_wav)} recording(s) to WAV", key="nat_convert_wav",
+                             icon=":material/audio_file:",
+                             help="Decodes m4a/mp3 to 16-bit WAV; originals are moved to _original_audio, not deleted."):
+        converted = _run("Converting recordings to WAV", lambda log: nat.convert_recordings_to_wav(corpus, log=log))
+        if converted and converted["skipped"]:
+            st.warning("Not converted: " + "; ".join(converted["skipped"][:10]))
+        elif converted:
+            st.rerun()
     for issue in nat.validate_corpus(corpus):
         {"error": st.error, "warning": st.warning, "ok": st.success}[issue["level"]](issue["message"])
     st.dataframe(_status_table(corpus), hide_index=True, alt="Audio and alignment counts per source and speaker")
@@ -175,6 +440,22 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
                     )
                 return result
             _run("Running MFA", align)
+        with st.expander("Use TextGrids from another aligner instead"):
+            st.caption("Folder layout: `<folder>/<speaker>/<sentence_id>.TextGrid`. Each grid is checked "
+                       "against the stimulus text; mismatches are rejected. Use one aligner for every "
+                       "source you compare.")
+            ext_source = st.selectbox("Source these TextGrids belong to", [nat.HUMAN, *systems],
+                                      key="nat_import_source")
+            ext_folder = st.text_input("TextGrid folder", key="nat_import_folder").strip()
+            if st.button("Import TextGrids", key="nat_import_grids", disabled=not ext_folder,
+                         icon=":material/upload_file:"):
+                def do_import(log):
+                    result = nat.import_alignments(corpus, ext_source, ext_folder)
+                    log(f"Imported {result['imported']}; skipped {result['skipped_existing']} existing.")
+                    for line in result["rejected"]:
+                        log(f"Rejected: {line}")
+                    return result
+                _run("Importing TextGrids", do_import)
 
     with st.container(border=True):
         st.markdown("**3 · Word durations and human − machine diff**")
@@ -199,6 +480,17 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
                 hide_index=True,
                 alt="MFA file and word coverage, including out-of-vocabulary words",
             )
+            durations = pd.read_csv(corpus.durations_csv, keep_default_na=False)
+            flagged = durations[durations.flag != "ok"]
+            if not flagged.empty:
+                st.markdown("**Flagged words** (each one removes its whole sentence from paired scoring)")
+                st.dataframe(
+                    flagged[["source", "speaker", "sentence_id", "word_idx", "word", "start_s", "end_s", "dur_s",
+                             "flag"]].assign(dur_ms=lambda f: (f.dur_s * 1000).round(1)).drop(columns="dur_s"),
+                    hide_index=True, alt="Words excluded by the alignment quality flags",
+                )
+            st.download_button("Download durations.csv", corpus.durations_csv.read_bytes(), "durations.csv",
+                               "text/csv", key="nat_dl_durations", icon=":material/download:")
             if int(coverage["OOV words"].sum()) > 0:
                 st.warning(
                     "Some words were out of vocabulary and their sentences are excluded from duration "
@@ -214,9 +506,13 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
                        icon=":material/model_training:", width="stretch"):
             def train(log):
                 model, report = nat.train_duration_model(nat.load_pairs(corpus, target))
-                model.save(corpus.model_path(target), {"system": target, **model.trained_on})
+                model.save(corpus.model_path(target), {"system": target, "word_model": model.word_kind,
+                                                       "pause_model": model.pause_kind, **model.trained_on})
                 report.to_csv(corpus.root / "models" / f"{nat._safe(target)}_dev_selection.csv", index=False)
                 log(f"selected word={model.word_kind}, pause={model.pause_kind}")
+                if not model.trained_on.get("beats_no_correction_on_dev", True):
+                    st.warning("No candidate beat leaving the machine timing unchanged on dev, so applying "
+                               "the layer will not change the audio. Add train sentences or check alignments.")
             _run(f"Training layer for {target}", train)
         oracle = st.toggle("Oracle (real human durations; a ceiling, not a result)", key="nat_oracle")
         if right.button("Apply to dev + test", key="nat_correct", disabled=not target,
@@ -278,6 +574,55 @@ def _render_pipeline(corpus: nat.Corpus) -> None:
             _run("Building listening test", lambda log: log(f"{len(nat.build_listening_test(corpus, chosen))} trials"))
 
 
+def _render_inspector(corpus: nat.Corpus) -> None:
+    """Waveform + spectrogram with MFA word boundaries, to judge alignment quality by eye and ear."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    st.markdown("#### Alignment inspector")
+    st.caption("Check that each boundary sits where the word starts and ends. A word with under "
+               f"{nat.COLLAPSE_MS_PER_PHONE:.0f} ms per akshara is almost certainly squeezed by the aligner.")
+    texts = corpus.text_of()
+    left, mid, right = st.columns(3)
+    source = left.selectbox("Source", [nat.HUMAN, *corpus.systems()], key="nat_insp_source")
+    speaker = mid.selectbox("Speaker", corpus.speakers(), key="nat_insp_speaker")
+    sid = right.selectbox("Sentence", list(texts), key="nat_insp_sid")
+    audio_path, grid = corpus.audio(source, speaker, sid), corpus.textgrid(source, speaker, sid)
+    if audio_path is None or not grid.is_file():
+        st.info("No audio or alignment for this choice yet.")
+        return
+    st.caption(texts[sid])
+    y, sr = nat._load_mono(audio_path, nat.MFA_SR)
+    words = nat.word_intervals(grid, len(y) / sr)
+    st.audio(y, sample_rate=sr)
+    fig, (ax_w, ax_s) = plt.subplots(2, 1, figsize=(12, 4.5), sharex=True, constrained_layout=True)
+    t = np.arange(len(y)) / sr
+    ax_w.plot(t, y, linewidth=0.5, color="#2a78d6")
+    ax_s.specgram(y, NFFT=400, Fs=sr, noverlap=240, cmap="magma")
+    ax_s.set_ylim(0, 6000)
+    for i, w in enumerate(words):
+        bad = w["dur_s"] * 1000 / max(w["n_phones"], 1) < nat.COLLAPSE_MS_PER_PHONE
+        for ax in (ax_w, ax_s):
+            ax.axvline(w["start_s"], color="#1baf7a", linewidth=1)
+            ax.axvline(w["end_s"], color="#e34948" if bad else "#eda100", linewidth=1, linestyle="--")
+        ax_w.text((w["start_s"] + w["end_s"]) / 2, ax_w.get_ylim()[1] * 0.85, str(i),
+                  ha="center", fontsize=9, color="#e34948" if bad else "black")
+    ax_w.set(ylabel="amplitude", title="Numbers = word index (see table); red = squeezed word")
+    ax_s.set(xlabel="time (s)", ylabel="Hz")
+    st.pyplot(fig, alt="Waveform and spectrogram with MFA word boundaries")
+    plt.close(fig)
+    table = pd.DataFrame(words)[["word_idx", "word", "start_s", "end_s", "dur_s", "n_phones", "pause_after_s"]]
+    table["ms_per_akshara"] = (table.dur_s * 1000 / table.n_phones.clip(lower=1)).round(0)
+    table["squeezed"] = table.ms_per_akshara < nat.COLLAPSE_MS_PER_PHONE
+    st.dataframe(table, hide_index=True, alt="Word intervals for the inspected sentence")
+    lexicon = corpus.root / "alignments" / "_lexicon_used.dict"
+    if lexicon.is_file():
+        st.download_button("Download the MFA lexicon used", lexicon.read_bytes(), lexicon.name, "text/plain",
+                           key="nat_dl_lexicon", icon=":material/download:")
+
+
 def _render_results(corpus: nat.Corpus) -> None:
     report_path = corpus.root / "eval" / "report_test.csv"
     if report_path.is_file():
@@ -297,6 +642,10 @@ def _render_results(corpus: nat.Corpus) -> None:
     else:
         st.info("Run Evaluate in the Pipeline section first.", title="No evaluation report yet")
 
+    if corpus.stimuli_csv.is_file() and corpus.splits_csv.is_file():
+        if st.toggle("Show alignment inspector", key="nat_insp_on",
+                     help="Waveform, spectrogram and MFA word boundaries for one sentence."):
+            _render_inspector(corpus)
     if not corpus.pairs_csv.is_file():
         return
     pairs = nat.load_pairs(corpus)

@@ -42,6 +42,10 @@ speaker recordings or model checkpoints into the Git repository.
    Or use **Naturalness → Pipeline → Create corpus and fixed splits** in the app.
    `init --force` only replaces a corpus before splits, alignments, generated audio, or duration
    tables exist. Once analysis has started, create a new corpus folder instead of overwriting it.
+   At least three unique stimuli are required for non-empty train/dev/test splits. If corpus setup
+   was interrupted before splits were written, the app lets you append more unique stimuli while
+   preserving existing IDs; after recordings or analysis begin, restore the corpus or start fresh
+   rather than changing the stimulus list.
 3. Record each speaker:
    - `data/naturalness/speakers/S01/clone_ref/passage.wav` plus `passage.txt`: **2–5 minutes**
      of read-aloud text (a story, a news paragraph). It must share **no sentence** with the stimuli.
@@ -91,14 +95,30 @@ Alignment output reports requested/aligned files, already-aligned files, failure
 words. The app also shows file and word coverage. Evaluation refuses to silently omit a selected
 system that has no valid data on the requested split.
 
-**Using Mayur's pipeline instead:** put his TextGrids at
-`alignments/<source>/<speaker>/<sentence_id>.TextGrid` (`source` = `human` or a system name)
-and skip `align` for those sources. Use his pipeline for **both** human and machine audio,
-never one aligner for each. Questions to ask him: MFA version and acoustic model, how he handles
-OOV and English words, whether he has checked boundaries against hand labels, and whether his
-TextGrids have a `words` and a `phones` tier.
+**Default: this project's own MFA step.** Mayur's pipeline details are not available, so `align`
+above is the pipeline of record. It is self-contained (IndicMFA Hindi acoustic model, word lexicon
+built from the model's phone set, identical settings for every source).
+
+**If TextGrids from another aligner arrive later** (for example Mayur's output), import them with
+validation instead of copying by hand:
+
+```bash
+python naturalness_cli.py import-alignments --source human --folder external/   # external/<speaker>/<sentence_id>.TextGrid
+```
+
+Each grid must have a `words` tier whose word sequence equals the stimulus after normalization;
+others are rejected and listed. Use one aligner for **every** source you compare (human and each
+TTS system). Human durations from one aligner and machine durations from another are not comparable,
+so either import his grids for all sources or use none of them.
 
 ## 3. Generate machine speech (stock and cloned)
+
+Which TTS to use: **Maya 2 Native** (`maya2-native`, local, Linux + CUDA 12.8) is the main system
+for the timing study. Generation is seeded so reruns are repeatable, and the voice is fixed by
+`MAYA_VOICE` (default `Ahana`). **Bulbul v3** is the cloud fallback. **MMS-TTS Hindi** is the only
+one whose duration weights this project can fine-tune (section 5). The correction layer (section 4)
+works on top of any of them. All six ASR models remain a separate benchmark (Research / Batch
+Research modes) and never touch these stimuli.
 
 ```bash
 python naturalness_cli.py generate --system bulbul-v3        # needs SARVAM_API_KEY
@@ -113,14 +133,31 @@ confirmation that every cloned speaker gave explicit permission. The passage mus
 recorded, must not contain experimental stimuli, and must only be used as the cloning reference.
 Review each backend's current terms before installation or use.
 
-Cloning models conflict with the app's pinned packages, so install them in their own venv and
-point the app at it:
+Cloning models conflict with the app's pinned packages: IndicF5 needs **Python 3.10 and
+transformers 4.50**, while the app runs Python 3.11 with transformers 5.6.2 (for Maya). So IndicF5
+lives in its own environment and the app calls it through `VOICE_CLONE_PYTHON`. The pins are in
+`requirements-clone.txt` (torch/torchaudio 2.8.0, torchcodec 0.7, IndicF5 at a fixed commit).
+
+**Local Linux / WSL2:**
 
 ```bash
-python -m venv .venv-clone
-.venv-clone/bin/pip install torch soundfile git+https://github.com/ai4bharat/IndicF5.git   # or: coqui-tts
+bash setup_clone_env.sh $PWD/.venv-clone      # prints the export line below
 export VOICE_CLONE_PYTHON=$PWD/.venv-clone/bin/python
 ```
+
+**Voice cloning on Hugging Face Spaces (Docker):** add these lines to the `Dockerfile` *before* any
+`USER` line (writing to `/opt` needs root), then rebuild:
+
+```dockerfile
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+COPY requirements-clone.txt setup_clone_env.sh /opt/clone-setup/
+RUN bash /opt/clone-setup/setup_clone_env.sh /opt/clone-env
+ENV VOICE_CLONE_PYTHON=/opt/clone-env/bin/python
+```
+
+Also accept the terms of `ai4bharat/IndicF5` on Hugging Face with the account that owns `HF_TOKEN`
+(the model is gated), and keep `HF_TOKEN` as a Space secret. The build log should end with
+`clone env OK: transformers 4.50.0 | torch 2.8.0 …`. The image grows by several GB.
 
 IndicF5 may be gated on Hugging Face (accept its terms, set `HF_TOKEN`). Its model snapshot is
 pinned in `voice_clone.py` for repeatable generation; update that revision deliberately when
@@ -138,7 +175,20 @@ python naturalness_cli.py align --sources bulbul-v3+dur
 python naturalness_cli.py durations
 ```
 
-`pairs.csv` holds, for every matched word: `diff_s = human − machine` (the error your professor
+**Unit of measurement: prosodic words.** Durations are measured on a word plus the enclitics that
+follow it (postpositions का की के को से में पर ने तक, copula/auxiliaries है हैं था थी थे थीं हो, particles
+भी ही सा सी), e.g. `पानी की`, `जाती है`. The grouping comes from the text, so it is identical for the
+human and every system. On the first pilot, MFA squeezed 40 of 57 rejected words, almost all such
+enclitics, to 10–20 ms, while the outer edges of the pair were reliable. A unit of k words may last
+1.5 s + 0.5 s × (k − 1) before it counts as "long".
+
+**Check alignment quality before trusting any number.** The coverage table reports
+`Collapsed (<25 ms/akshara) %`: words the aligner squeezed to almost nothing. Above a few percent,
+the duration differences mostly measure aligner error. **Results → Show alignment inspector**
+shows the waveform, spectrogram and boundaries for any sentence. The exact MFA lexicon used is
+saved as `alignments/_lexicon_used.dict` (phone set: `_lexicon_used.phones.txt`).
+
+`pairs.csv` holds, for every matched unit: `diff_s = human − machine` (the error your professor
 described), `log_ratio = log(human/machine)`, `log_ratio_resid` (with each sentence's overall
 speaking rate removed) and `pause_diff_s`. Sentences with any badly aligned word (OOV, under
 30 ms, over 1.5 s, or a word sequence that differs from the text) are dropped whole.
@@ -151,9 +201,12 @@ sits on top of any TTS:
 - **Features:** machine timing, akshara/syllable/matra counts, conjuncts, function word,
   position in the sentence, following punctuation, question or statement, and the speaker's
   average rate (learned on train only).
-- **Candidates:** a global rate factor, per-bucket means, ridge regression and gradient
-  boosting. Pauses are either kept as the machine produced them, or learned with a
-  "pause or not" classifier plus a pause-length regressor. Every candidate is fitted on
+- **Candidates:** **no correction** (the baseline every layer must beat), a global rate factor,
+  per-bucket means, ridge regression and gradient boosting. Pauses are either kept as the machine
+  produced them, or learned with a "pause or not" classifier plus a pause-length regressor (where
+  no pause is predicted, the machine's short gap is kept or shrunk to the typical human
+  between-word gap, never deleted). If "no correction" wins on dev, `train` says so and `correct`
+  leaves the audio unchanged. Ties go to the simpler model. Every candidate is fitted on
   **train**, the best is chosen on **dev**, and the chosen one is refitted on train + dev.
   **Test is never used.**
 - **Applying it:** each word is time-stretched to its predicted duration with Praat
@@ -171,9 +224,13 @@ not full end-to-end VITS training. The Transformers `VitsModel` API does not cur
 end-to-end training.
 
 The training targets use `dur_s_m + diff_s` (the measured machine duration plus the
-human-minus-machine error) for each valid word. MFA's word duration is distributed across that
-word's character tokens; measured pauses are assigned to inter-word spaces. This is a practical
-initial supervision mapping, not phoneme-level duration supervision. Inspect alignments and use
+human-minus-machine error, i.e. the human duration) for each valid word, and the human pause for
+each inter-word space. Within a word, frames are shared across its tokens **in proportion to the
+base MMS model's own predicted token durations**. This includes the blank token VITS inserts after
+every character: giving blanks zero frames would teach a timing distribution the acoustic model
+never saw. Sentences that cannot be mapped (for example, a character missing from the MMS
+vocabulary) are skipped and listed in the metadata rather than aborting the run. This is
+word-level supervision, not phoneme-level supervision. Inspect alignments and use
 enough varied training sentences before drawing conclusions.
 
 First generate and align the baseline MMS audio as well as human recordings, then rebuild
@@ -237,6 +294,8 @@ Then open the app → **Naturalness** → **Listening test**. Each listener ente
 consent. Each trial plays the human and one system on the same test sentence (A/B order is
 random), and the listener picks the real person.
 
+- Clip files are named `<trial>_A.wav` / `<trial>_B.wav` only, so a copied kit does not reveal
+  which clip is human.
 - All clips are resampled to 16 kHz, trimmed to 150 ms around the speech and loudness-matched,
   so only the voice gives the answer away.
 - Each listener hears each sentence only once, under one system (Latin square). The `+oracle`
@@ -255,8 +314,15 @@ claiming it. Spaces storage is not persistent, so download `responses.csv` after
 ## Tests
 
 ```bash
+python tests/test_pipeline.py      # end-to-end on synthetic speech, fake MFA, no GPU or network
 python tests/test_naturalness.py
 ```
+
+`test_pipeline.py` checks each action item: durations and `diff_s = human − machine`, a layer that
+beats "no correction" on dev and never sees test, corrected audio closer to the human on test
+(word RMSE and pause placement), cloning blocked by passage or prompt leakage and by missing
+consent, blind listening-clip names, validated TextGrid import, and MMS token targets that sum to
+the human frames with blanks included.
 
 This runs the whole pipeline on synthetic speech, with `tests/fake_mfa.py` standing in for MFA.
 It also covers supplemental lexicons/code-mixed OOV reporting against the real Hindi acoustic

@@ -51,51 +51,88 @@ def _allocate_frames(duration_s: float, chars: int, frames_per_second: float) ->
     return [float(base + (index < remainder)) for index in range(chars)]
 
 
+def _distribute(total: int, weights: list[float]) -> list[float]:
+    """Split an integer frame count over tokens in proportion to `weights` (largest remainder).
+    Equal shares when every weight is zero."""
+    if not weights:
+        return []
+    w = np.clip(np.asarray(weights, dtype=float), 0.0, None)
+    w = w / w.sum() if w.sum() > 0 else np.full(len(w), 1.0 / len(w))
+    raw = w * total
+    out = np.floor(raw)
+    for index in np.argsort(-(raw - out), kind="stable")[: int(total - out.sum())]:
+        out[index] += 1
+    return out.tolist()
+
+
 def build_duration_example(
     text: str,
     rows: pd.DataFrame,
     tokenizer,
     frames_per_second: float,
+    base_token_frames=None,
 ) -> DurationExample:
-    """Map MFA word durations and pauses to MMS character-token duration targets."""
+    """Map MFA word durations and pauses to MMS token duration targets.
+
+    Each word gets the human duration (machine duration + diff), each inter-word space the human
+    pause, punctuation markers zero. Within a unit (word / space / marker), frames are shared over
+    its tokens in proportion to the BASE model's own predicted token durations when
+    `base_token_frames(input_ids)` is given. VITS inserts a blank token after every character; the
+    pretrained predictor gives blanks a real share of time, so assigning them zero (or splitting
+    evenly) would teach a timing distribution the acoustic model never saw. Each blank belongs to
+    the character before it (the leading blank to the first character).
+    """
     if rows.empty:
         raise ValueError("MFA duration rows are empty.")
     if not math.isfinite(frames_per_second) or frames_per_second <= 0:
         raise ValueError("The MMS frame rate must be positive and finite.")
-    expected = nat.tokens_with_punct(text)
+    sentence = str(rows.sentence_id.iloc[0])
+    expected = nat.unit_tokens(text)   # prosodic units, as in durations.csv / pairs.csv
     rows = rows.sort_values("word_idx").reset_index(drop=True)
     if len(rows) != len(expected):
-        raise ValueError(f"{rows.sentence_id.iloc[0]}: MFA pair count does not match the stimulus word count.")
+        raise ValueError(f"{sentence}: MFA pair count does not match the stimulus word count.")
     if rows.word.astype(str).tolist() != [word for word, _ in expected]:
-        raise ValueError(f"{rows.sentence_id.iloc[0]}: MFA words do not match the normalized stimulus.")
+        raise ValueError(f"{sentence}: MFA words do not match the normalized stimulus.")
 
-    chars: list[str] = []
-    char_frames: list[float] = []
+    units: list[tuple[str, int]] = []   # (characters, total frames)
     for index, (word, punctuation) in enumerate(expected):
         if index:
-            chars.append(" ")
             pause = float(rows.iloc[index - 1].pause_after_s_h)
             if not math.isfinite(pause) or pause < 0:
-                raise ValueError(f"{rows.sentence_id.iloc[0]}: pause durations must be finite and non-negative.")
-            char_frames.append(max(0, int(round(pause * frames_per_second))))
-
-        word_frames = float(rows.iloc[index].dur_s_m) + float(rows.iloc[index].diff_s)
-        allocated = _allocate_frames(word_frames, len(word), frames_per_second)
-        chars.extend(word)
-        char_frames.extend(allocated)
-
+                raise ValueError(f"{sentence}: pause durations must be finite and non-negative.")
+            units.append((" ", max(0, int(round(pause * frames_per_second)))))
+        human_s = float(rows.iloc[index].dur_s_m) + float(rows.iloc[index].diff_s)
+        if not math.isfinite(human_s) or human_s <= 0:
+            raise ValueError(f"{sentence}: word durations must be positive and finite.")
+        units.append((word, max(1, int(round(human_s * frames_per_second)))))
         marker = _PUNCTUATION.get(punctuation)
         if marker:
-            chars.append(marker)
-            char_frames.append(0.0)
+            units.append((marker, 0))
 
-    model_text = unicodedata.normalize("NFC", "".join(chars))
+    raw_text = "".join(chars for chars, _ in units)
+    char_unit = [u for u, (chars, _) in enumerate(units) for _ in chars]
+    model_text = unicodedata.normalize("NFC", raw_text)
     model_text = tokenizer.normalize_text(model_text) if hasattr(tokenizer, "normalize_text") else model_text
-    if len(model_text) != len(char_frames):
-        raise ValueError(
-            f"{rows.sentence_id.iloc[0]}: tokenizer normalization changes text length; "
-            "cannot map MFA durations safely."
-        )
+    if len(model_text) != len(char_unit):
+        raise ValueError(f"{sentence}: tokenizer normalization changes text length; cannot map MFA durations safely.")
+    # VitsTokenizer silently drops characters missing from its vocabulary (MMS Hindi has no "।", "?"
+    # or ","). Drop them here the same way, so tokens and duration targets stay aligned. A dropped
+    # punctuation marker carries 0 frames, so the human timing total is unchanged.
+    vocab = set(tokenizer.get_vocab()) if hasattr(tokenizer, "get_vocab") else None
+    if vocab:
+        kept = [i for i, c in enumerate(model_text) if c in vocab]
+        model_text = "".join(model_text[i] for i in kept)
+        char_unit = [char_unit[i] for i in kept]
+        if not char_unit:
+            raise ValueError(f"{sentence}: no characters of this sentence are in the MMS vocabulary.")
+        # A unit with frames but no surviving characters (e.g. a pause, if " " were missing) gives its
+        # frames to the nearest earlier unit that still has tokens, so the sentence total is kept.
+        present = set(char_unit)
+        for u, (chars, total) in enumerate(units):
+            if total > 0 and u not in present:
+                host = max((k for k in present if k < u), default=min(present))
+                units[host] = (units[host][0], units[host][1] + total)
+                units[u] = (chars, 0)
 
     encoded = tokenizer(model_text, add_special_tokens=False)
     input_ids = encoded["input_ids"]
@@ -105,19 +142,29 @@ def build_duration_example(
     expected_length = len(model_text) * (2 if add_blank else 1) + int(add_blank)
     if len(input_ids) != expected_length:
         raise ValueError(
-            f"{rows.sentence_id.iloc[0]}: unexpected MMS tokenization length "
-            f"({len(input_ids)} tokens for {len(model_text)} characters)."
+            f"{sentence}: unexpected MMS tokenization length ({len(input_ids)} tokens for "
+            f"{len(model_text)} characters); a character is probably missing from the MMS vocabulary."
         )
 
+    # token -> owning unit
     if add_blank:
-        token_frames = [0.0] * len(input_ids)
-        token_frames[1::2] = char_frames
+        token_unit = [char_unit[0]] + [char_unit[k] for k in range(len(char_unit)) for _ in (0, 1)]
     else:
-        token_frames = char_frames
+        token_unit = list(char_unit)
+    weights = [1.0] * len(input_ids)
+    if base_token_frames is not None:
+        weights = [float(v) for v in base_token_frames(input_ids)]
+        if len(weights) != len(input_ids):
+            raise ValueError(f"{sentence}: base duration prediction length does not match the tokens.")
+    token_frames = [0.0] * len(input_ids)
+    for u, (_, total) in enumerate(units):
+        members = [t for t, owner in enumerate(token_unit) if owner == u]
+        for t, frames in zip(members, _distribute(total, [weights[t] for t in members])):
+            token_frames[t] = frames
     if sum(token_frames) <= 0:
-        raise ValueError(f"{rows.sentence_id.iloc[0]}: no positive duration targets were produced.")
+        raise ValueError(f"{sentence}: no positive duration targets were produced.")
     return DurationExample(
-        sentence_id=str(rows.sentence_id.iloc[0]),
+        sentence_id=sentence,
         split=str(rows.split.iloc[0]),
         input_ids=[int(value) for value in input_ids],
         duration_frames=token_frames,
@@ -130,19 +177,24 @@ def prepare_examples(
     tokenizer,
     frames_per_second: float,
     splits: tuple[str, ...] = ("train", "dev"),
-) -> list[DurationExample]:
-    """Build only the requested split examples; callers train with train/dev, never test."""
+    base_token_frames=None,
+    log=print,
+) -> tuple[list[DurationExample], list[str]]:
+    """Build only the requested split examples; callers train with train/dev, never test.
+    A sentence that cannot be mapped is skipped and reported, not allowed to abort the run."""
     texts = corpus.text_of()
     selected = pairs[pairs.split.isin(splits)]
-    examples = []
+    examples, skipped = [], []
     for (speaker, sentence_id), group in selected.groupby(["speaker", "sentence_id"], sort=True):
         if sentence_id not in texts:
             raise ValueError(f"Unknown sentence ID in duration pairs: {sentence_id}.")
         try:
-            examples.append(build_duration_example(texts[sentence_id], group, tokenizer, frames_per_second))
+            examples.append(build_duration_example(texts[sentence_id], group, tokenizer, frames_per_second,
+                                                   base_token_frames))
         except ValueError as exc:
-            raise ValueError(f"{speaker}/{sentence_id}: {exc}") from exc
-    return examples
+            skipped.append(f"{speaker}/{sentence_id}: {exc}")
+            log(f"skipped {speaker}/{sentence_id}: {exc}")
+    return examples, skipped
 
 
 def _load_base_model(device: str):
@@ -196,15 +248,31 @@ def fine_tune_duration_predictor(
     sample_rate = int(model.config.sampling_rate)
     hop_length = math.prod(model.config.upsample_rates)
     frames_per_second = sample_rate / hop_length
-    examples = prepare_examples(corpus, pairs, tokenizer, frames_per_second)
+    predictor = model.duration_predictor
+
+    def base_token_frames(input_ids: list[int]) -> list[float]:
+        """The unchanged base model's own token durations (noise off), in frames."""
+        ids = torch.tensor([input_ids], dtype=torch.long, device=device)
+        mask = torch.ones_like(ids, dtype=torch.float32)
+        with torch.no_grad():
+            hidden = model.text_encoder(input_ids=ids, padding_mask=mask.unsqueeze(-1),
+                                        attention_mask=mask).last_hidden_state.transpose(1, 2)
+            log_w = predictor(hidden, mask.unsqueeze(1), reverse=True, noise_scale=0.0)
+        return torch.exp(log_w).reshape(-1).cpu().tolist()
+
+    model.eval()
+    examples, skipped = prepare_examples(corpus, pairs, tokenizer, frames_per_second,
+                                         base_token_frames=base_token_frames, log=log)
     train_examples = [example for example in examples if example.split == "train"]
     dev_examples = [example for example in examples if example.split == "dev"]
     if len(train_examples) < MIN_TRAIN_SENTENCES or len(dev_examples) < MIN_DEV_SENTENCES:
-        raise ValueError("Some train/dev pairs could not be converted to MMS duration targets.")
+        raise ValueError(
+            f"Only {len(train_examples)} train / {len(dev_examples)} dev sentences could be converted to MMS "
+            f"duration targets (need {MIN_TRAIN_SENTENCES}/{MIN_DEV_SENTENCES}). Skipped: {skipped[:5]}"
+        )
 
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    predictor = model.duration_predictor
     for parameter in predictor.parameters():
         parameter.requires_grad_(True)
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=learning_rate)
@@ -288,6 +356,8 @@ def fine_tune_duration_predictor(
         "frozen_components": ["text_encoder", "posterior_encoder", "flow", "waveform_decoder"],
         "objective": "MMS VITS stochastic duration predictor negative log-likelihood",
         "duration_target": "MMS word duration + (human word duration - MMS word duration)",
+        "token_allocation": "per word/pause, proportional to the base model's own token durations (noise 0)",
+        "skipped_sentences": skipped,
         "training_split": "train",
         "selection_split": "dev",
         "held_out_split": "test",

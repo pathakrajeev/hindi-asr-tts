@@ -1,10 +1,11 @@
-﻿"""Command-line runner for the naturalness pipeline. See NATURALNESS.md for the full protocol.
+"""Command-line runner for the naturalness pipeline. See NATURALNESS.md for the full protocol.
 
     python naturalness_cli.py init --stimuli sentences.txt --speakers S01
     python naturalness_cli.py split
     python naturalness_cli.py check
     python naturalness_cli.py generate --system bulbul-v3
     python naturalness_cli.py align --sources clone_ref
+    python naturalness_cli.py import-alignments --source human --folder external_textgrids/   (optional)
     python naturalness_cli.py prompt --speaker S01
     python naturalness_cli.py generate --system clone-indicf5
     python naturalness_cli.py align --sources human bulbul-v3 clone-indicf5
@@ -75,6 +76,22 @@ def cmd_align(args):
         print(f"Unresolved words (these align as OOV): {', '.join(result['oov_words'][:30])}")
 
 
+def cmd_convert_audio(args):
+    result = nat.convert_recordings_to_wav(_corpus(args))
+    print(f"converted {result['converted']} recording(s) to WAV")
+    for line in result["skipped"]:
+        print(f"[SKIPPED] {line}")
+
+
+def cmd_import_alignments(args):
+    result = nat.import_alignments(_corpus(args), args.source, args.folder, force=args.force)
+    print(f"imported {result['imported']} TextGrids; skipped {result['skipped_existing']} existing")
+    for line in result["rejected"]:
+        print(f"[REJECTED] {line}")
+    if result["rejected"] and not result["imported"]:
+        sys.exit(1)
+
+
 def cmd_prompt(args):
     wav, txt = nat.make_clone_prompt(_corpus(args), args.speaker)
     print(f"{wav} ({txt.read_text(encoding='utf-8')})")
@@ -105,6 +122,9 @@ def cmd_train(args):
     report.to_csv(corpus.root / "models" / f"{nat._safe(args.system)}_dev_selection.csv", index=False)
     print(report.round(2).to_string(index=False))
     print(f"\nSelected word={model.word_kind}, pause={model.pause_kind}; saved {path}")
+    if not model.trained_on.get("beats_no_correction_on_dev", True):
+        print("WARNING: no candidate beat leaving the machine timing unchanged on dev. `correct` will not "
+              "change the audio. Collect more train sentences or check the alignments.")
 
 
 def cmd_mms_finetune(args):
@@ -165,6 +185,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_split)
 
     sub.add_parser("check", help="recordings, splits and cloning-leakage check").set_defaults(fn=cmd_check)
+    sub.add_parser("convert-audio", help="convert m4a/mp3 recordings to WAV (originals kept)").set_defaults(
+        fn=cmd_convert_audio)
 
     p = sub.add_parser("generate", help="synthesize all stimuli with a TTS system")
     p.add_argument("--system", required=True, choices=[*nat.STOCK_SYSTEMS, *nat.CLONE_SYSTEMS])
@@ -190,6 +212,13 @@ def main(argv=None):
     p.add_argument("--jobs", type=int, default=2)
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_align)
+
+    p = sub.add_parser("import-alignments",
+                       help="copy externally made TextGrids (validated against the stimuli) for one source")
+    p.add_argument("--source", required=True, help="human or a system name")
+    p.add_argument("--folder", required=True, help="<folder>/<speaker>/<sentence_id>.TextGrid")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_import_alignments)
 
     p = sub.add_parser("prompt", help="cut a 6-12 s cloning prompt from the aligned passage")
     p.add_argument("--speaker", required=True)

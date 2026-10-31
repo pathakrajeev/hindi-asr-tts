@@ -25,7 +25,7 @@ INDICF5_REVISION = "fb652a96e508091045890dae5bb99fe511facbcf"
 BACKENDS = {
     "indicf5": {
         "label": "IndicF5 (AI4Bharat, Hindi)",
-        "install": "pip install git+https://github.com/ai4bharat/IndicF5.git soundfile",
+        "install": "bash setup_clone_env.sh /opt/clone-env   (Python 3.10 + requirements-clone.txt)",
         "note": "Conditions on a 6-12 s prompt plus its exact transcript. The Hugging Face repo may be gated: "
                 "accept its terms and set HF_TOKEN. Check the model licence before use.",
     },
@@ -134,13 +134,20 @@ def generate_batch(backend: str, prompt_wav: str, prompt_text: str, jobs: list[d
             log(f"cloned {Path(event['out']).name}")
 
     python = os.getenv("VOICE_CLONE_PYTHON")
+    if python and not Path(python).is_file():
+        raise RuntimeError(f"VOICE_CLONE_PYTHON points to {python}, which does not exist. Rebuild the clone "
+                           "environment (setup_clone_env.sh) or fix the variable.")
     if not python:
         try:
             return run_jobs(spec, emit)
         except ImportError as exc:
             info = BACKENDS[backend]
-            raise RuntimeError(f"{info['label']} is not installed here ({exc}). Create a separate venv, run "
-                               f"`{info['install']}`, and set VOICE_CLONE_PYTHON to its python.") from exc
+            raise RuntimeError(
+                f"{info['label']} is not installed in this environment ({exc}). It needs its own environment: "
+                f"run `{info['install']}` and set VOICE_CLONE_PYTHON to that environment's python. On Hugging "
+                "Face Spaces, do this in the Dockerfile (NATURALNESS.md, 'Voice cloning on Hugging Face Spaces') "
+                "and restart the Space."
+            ) from exc
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
         json.dump(spec, handle, ensure_ascii=False)
         spec_path = handle.name

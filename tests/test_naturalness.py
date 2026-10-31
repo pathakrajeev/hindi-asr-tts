@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import naturalness as nat  # noqa: E402
 import mms_finetune  # noqa: E402
+import naturalness_ui  # noqa: E402
 import voice_clone  # noqa: E402
 
 VOCAB = ["आज", "मौसम", "बहुत", "अच्छा", "है", "हम", "बाज़ार", "जाएँगे", "क्या", "तुम", "स्कूल", "गए", "थे",
@@ -213,6 +214,42 @@ def test_empty_pipeline_and_force_protection(tmp_path=None):
         raise AssertionError("force must not overwrite a corpus after splits are created")
 
 
+def test_missing_split_recovery_guard(tmp_path=None):
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    corpus = nat.init_corpus(tmp / "corpus", ["आज है।", "कल है।", "अब है।"], ["S01"])
+    assert not naturalness_ui._has_analysis_artifacts(corpus)
+    nat.make_splits(corpus)
+    corpus.splits_csv.unlink()
+    generated = corpus.generated_path("mms-tts-hin", "S01", "sent_001")
+    generated.parent.mkdir(parents=True, exist_ok=True)
+    generated.write_bytes(b"already analyzed")
+    assert naturalness_ui._has_analysis_artifacts(corpus)
+
+
+def test_append_stimuli_before_splits(tmp_path=None):
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    corpus = nat.init_corpus(tmp / "corpus", ["आज है।"], ["S01"])
+    updated = nat.append_stimuli(corpus, ["कल है।", "अब है।"])
+    assert updated.sentence_id.tolist() == ["sent_001", "sent_002", "sent_003"]
+    assert updated.text.tolist() == ["आज है।", "कल है।", "अब है।"]
+    nat.make_splits(corpus)
+
+    try:
+        nat.append_stimuli(corpus, ["परसों है।"])
+    except FileExistsError as exc:
+        assert "frozen after splits.csv" in str(exc)
+    else:
+        raise AssertionError("stimuli must not change after fixed splits are created")
+
+    incomplete = nat.init_corpus(tmp / "incomplete", ["आज है।"], ["S01"])
+    try:
+        nat.append_stimuli(incomplete, ["आज है।"])
+    except ValueError as exc:
+        assert "duplicates text already in the corpus" in str(exc)
+    else:
+        raise AssertionError("appending an existing normalized sentence must be rejected")
+
+
 def test_voice_clone_worker_failures_and_model_revision(tmp_path=None):
     tmp = Path(tmp_path or tempfile.mkdtemp())
     blocker = tmp / "not_a_directory"
@@ -320,7 +357,9 @@ def test_mms_duration_finetuning(tmp_path=None):
             super().__init__()
             self.scale = torch.nn.Parameter(torch.tensor(1.0))
 
-        def forward(self, _hidden, _mask, durations, **_kwargs):
+        def forward(self, hidden, _mask, durations=None, reverse=False, **_kwargs):
+            if reverse:
+                return torch.log(torch.full((hidden.shape[0], 1, hidden.shape[2]), 2.0)) + 0 * self.scale
             target = durations.mean(dim=(1, 2))
             return (self.scale - target).square() + 0.1
 
@@ -349,7 +388,7 @@ def test_mms_duration_finetuning(tmp_path=None):
     expected_frames += sum(round(value * 100.0) for value in sentence_pairs.pause_after_s_h.iloc[:-1])
     assert sum(example.duration_frames) == expected_frames
     assert example.split == "train"
-    prepared = mms_finetune.prepare_examples(
+    prepared, _skipped = mms_finetune.prepare_examples(
         corpus, pd.concat([sentence_pairs, pd.read_csv(corpus.pairs_csv).query("split == 'test'")]),
         tokenizer, 100.0,
     )
@@ -469,6 +508,8 @@ if __name__ == "__main__":
     test_supplemental_lexicon_and_code_mixed_oov()
     test_split_validation()
     test_empty_pipeline_and_force_protection()
+    test_missing_split_recovery_guard()
+    test_append_stimuli_before_splits()
     test_voice_clone_worker_failures_and_model_revision()
     test_mms_duration_finetuning()
     test_recording_import_and_clone_consent()

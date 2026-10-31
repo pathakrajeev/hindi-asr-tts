@@ -1514,7 +1514,7 @@ def render_research_tab():
         release_models = columns[3].toggle("Free models after use", value=True, key="research_release",
                                            help="Unloads local models after each ASR/TTS step to reduce peak memory. A selected loopback judge may be loaded again later. Loading time is reported separately from inference.")
         deepfake_check = columns[4].toggle("Synthetic-speech check", value=False, key="research_deepfake",
-                                           help="Scores the input and every TTS output with the zero-shot Indic detector, plus your own trained detector if one is loaded in Synthetic speech mode.")
+                                           help="Scores the input and every TTS output with the zero-shot Indic detector, plus your own trained detector if one is loaded in Batch Research → Synthetic speech stage.")
         use_gpu = columns[5].toggle(
             "Use GPU for local models",
             value=gpu_available,

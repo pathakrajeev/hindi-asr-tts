@@ -36,9 +36,15 @@ COPY .streamlit ./.streamlit
 
 RUN useradd --create-home --uid 1000 appuser \
     && mkdir -p /home/appuser/.local/share/MFA /home/appuser/.cache/triton /data/naturalness \
-    && chown -R appuser:appuser /app /home/appuser/.local /home/appuser/.cache /data
+       /opt/clone-env /opt/clone-setup \
+    && chown -R appuser:appuser /app /home/appuser/.local /home/appuser/.cache /data \
+       /opt/clone-env /opt/clone-setup
 
 USER appuser
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+COPY requirements-clone.txt setup_clone_env.sh /opt/clone-setup/
+RUN bash /opt/clone-setup/setup_clone_env.sh /opt/clone-env
+ENV VOICE_CLONE_PYTHON=/opt/clone-env/bin/python
 
 RUN /opt/mfa/bin/mfa server init
 

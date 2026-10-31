@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import io
 import json
 import math
 import os
@@ -108,6 +109,35 @@ def tokens_with_punct(text: str) -> list[tuple[str, str]]:
             out.append([word, "none"])
         out.append([words[-1], cls])
     return [(w, c) for w, c in out]
+
+
+# Prosodic words. Hindi postpositions, auxiliaries/copula and particles are enclitics: spoken as one
+# prosodic unit with the word before them. Forced aligners place the boundary inside such a pair
+# unreliably (on pilot data MFA squeezed 40 of 57 bad words, mostly these, to 10-20 ms), while the
+# pair's outer edges are reliable. So durations are measured on units = a word plus any enclitics that
+# follow it without punctuation in between. The grouping comes from the TEXT alone, so it is identical
+# for the human and every TTS system, and available for new sentences at correction time.
+ENCLITICS = frozenset("का की के को से में पर ने तक है हैं था थी थे थीं हो हूँ हूं भी ही सा सी".split())
+LONG_PER_EXTRA_WORD_S = 0.5   # a unit of k words may last MAX_WORD_S + 0.5 s x (k - 1)
+COLLAPSE_MS_PER_PHONE = 25.0  # under this per acoustic unit (akshara), the aligner squeezed the word
+
+
+def unit_spans(text: str) -> list[list[int]]:
+    """Token indices of each prosodic unit (see ENCLITICS)."""
+    tokens = tokens_with_punct(text)
+    spans: list[list[int]] = []
+    for i, (word, _) in enumerate(tokens):
+        if spans and word in ENCLITICS and tokens[i - 1][1] == "none":
+            spans[-1].append(i)
+        else:
+            spans.append([i])
+    return spans
+
+
+def unit_tokens(text: str) -> list[tuple[str, str]]:
+    """(unit text, punctuation class after it), e.g. ("पानी की", "none")."""
+    tokens = tokens_with_punct(text)
+    return [(" ".join(tokens[i][0] for i in span), tokens[span[-1]][1]) for span in unit_spans(text)]
 
 
 _CONSONANT = re.compile("[क-हक़-य़]")
@@ -291,6 +321,64 @@ def init_corpus(root: Path, sentences: list[str], speakers: list[str], force: bo
     return corpus
 
 
+def append_stimuli(corpus: Corpus, sentences: list[str]) -> pd.DataFrame:
+    """Append stimuli to an incomplete corpus before recordings or analysis begin."""
+    if corpus.splits_csv.exists():
+        raise FileExistsError("Stimuli are frozen after splits.csv is created.")
+    if not corpus.stimuli_csv.is_file():
+        raise FileNotFoundError(f"{corpus.stimuli_csv} not found. Create the corpus first.")
+    protected = (
+        corpus.durations_csv,
+        corpus.pairs_csv,
+        corpus.root / "generated",
+        corpus.root / "alignments",
+        corpus.root / "models",
+        corpus.root / "eval",
+    )
+    if any(path.is_file() if path.suffix else path.is_dir() for path in protected):
+        raise ValueError("This corpus already contains analysis data; do not change its stimuli.")
+    speaker_audio = corpus.root / "speakers"
+    if speaker_audio.is_dir() and any(
+        path.is_file()
+        for speaker_dir in speaker_audio.iterdir()
+        for path in (speaker_dir / "stimuli").glob("*")
+    ):
+        raise ValueError("Human stimulus recordings already exist; do not change the corpus stimuli.")
+
+    frame = corpus.stimuli()
+    additions = [" ".join(sentence.split()) for sentence in sentences if sentence.strip()]
+    if not additions:
+        raise ValueError("Enter at least one additional non-empty stimulus sentence.")
+    existing_normalized = set(frame.text.map(mfa_text))
+    added_normalized = [mfa_text(sentence) for sentence in additions]
+    if len(set(added_normalized)) != len(added_normalized):
+        raise ValueError("The additional stimulus list contains duplicates.")
+    duplicates = existing_normalized.intersection(added_normalized)
+    if duplicates:
+        raise ValueError("An additional stimulus duplicates text already in the corpus.")
+
+    used_ids = set(frame.sentence_id)
+    next_id = len(frame) + 1
+    width = max(3, len(str(next_id + len(additions) - 1)))
+    new_rows = []
+    for sentence in additions:
+        while f"sent_{next_id:0{width}d}" in used_ids:
+            next_id += 1
+        sentence_id = f"sent_{next_id:0{width}d}"
+        used_ids.add(sentence_id)
+        new_rows.append({"sentence_id": sentence_id, "text": sentence})
+        next_id += 1
+
+    updated = pd.concat([frame, pd.DataFrame(new_rows)], ignore_index=True)
+    temp_path = corpus.stimuli_csv.with_suffix(".csv.tmp")
+    try:
+        updated.to_csv(temp_path, index=False, encoding="utf-8")
+        temp_path.replace(corpus.stimuli_csv)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return updated
+
+
 def import_recordings(corpus: Corpus, audio_uploads, transcript_uploads=()) -> dict[str, int]:
     """Import `speaker__sentence_id.wav` and separate `speaker__passage.wav/.txt` files."""
     if not corpus.stimuli_csv.is_file():
@@ -337,6 +425,11 @@ def import_recordings(corpus: Corpus, audio_uploads, transcript_uploads=()) -> d
             raise ValueError(f"{name}: could not decode audio ({type(exc).__name__}: {exc}).") from exc
         finally:
             temp_path.unlink(missing_ok=True)
+        if suffix != ".wav":
+            # Phone formats (m4a, mp3) are stored as 16-bit WAV at their own sample rate.
+            buffer = io.BytesIO()
+            sf.write(buffer, audio, sr, format="WAV", subtype="PCM_16")
+            raw, suffix = buffer.getvalue(), ".wav"
         if is_passage:
             target = corpus.clone_dir(speaker) / f"passage{suffix}"
         else:
@@ -452,6 +545,11 @@ def validate_corpus(corpus: Corpus) -> list[dict]:
     if not speakers:
         add("error", "No speakers in speakers/.")
     stim_hashes = {}
+    not_wav = non_wav_recordings(corpus)
+    if not_wav:
+        add("warning", f"{len(not_wav)} recording(s) are not WAV (e.g. {not_wav[0].name}). They still work, but "
+                       "converting them once to WAV makes every later step faster and more reliable "
+                       "(Convert recordings to WAV / `convert-audio`).")
     for speaker in speakers:
         recorded = [sid for sid in stimuli.sentence_id if corpus.audio(HUMAN, speaker, sid)]
         add("ok" if len(recorded) == len(stimuli) else "warning",
@@ -459,14 +557,14 @@ def validate_corpus(corpus: Corpus) -> list[dict]:
         for sid in recorded:
             path = corpus.audio(HUMAN, speaker, sid)
             stim_hashes[_file_hash(path)] = f"{speaker}/{sid}"
-            if sf.info(str(path)).samplerate < MFA_SR:
+            if _audio_info(path)[0] < MFA_SR:
                 add("warning", f"{speaker}/{sid}: sample rate below 16 kHz")
         passage_audio = corpus.audio(CLONE_REF, speaker, "passage")
         passage_text = corpus.clone_dir(speaker) / "passage.txt"
         if not passage_audio or not passage_text.is_file():
             add("warning", f"{speaker}: no clone_ref/passage.wav + passage.txt (needed for voice cloning)")
             continue
-        seconds = sf.info(str(passage_audio)).duration
+        seconds = _audio_info(passage_audio)[1]
         if seconds < 60:
             add("warning", f"{speaker}: cloning passage is {seconds:.0f} s; record 2-5 minutes")
         leaks = leakage_report(passage_text.read_text(encoding="utf-8"), stimuli)
@@ -477,6 +575,12 @@ def validate_corpus(corpus: Corpus) -> list[dict]:
         else:
             add("ok", f"{speaker}: cloning passage shares at most {leaks.longest_shared_run.max()} consecutive "
                       f"words with any stimulus (limit {LEAK_NGRAM - 1})")
+        prompt_text = corpus.clone_dir(speaker) / "prompt.txt"
+        if prompt_text.is_file():
+            prompt_leaks = leakage_report(prompt_text.read_text(encoding="utf-8"), stimuli)
+            if prompt_leaks.leak.any():
+                add("error", f"{speaker}: clone_ref/prompt.txt shares text with stimuli "
+                             f"({', '.join(prompt_leaks[prompt_leaks.leak].sentence_id[:5])}); re-cut it from the passage.")
         clone_files = [p for p in corpus.clone_dir(speaker).iterdir() if p.suffix.lower() in AUDIO_SUFFIXES]
         for path in clone_files:
             if _file_hash(path) in stim_hashes:
@@ -543,6 +647,26 @@ def word_intervals(path: Path, audio_seconds: float | None = None) -> list[dict]
         rows.append({"word_idx": i, "word": word, "start_s": start, "end_s": end, "dur_s": end - start,
                      "pause_after_s": max(next_start - end, 0.0), "n_phones": len(inside), "oov": oov})
     return rows
+
+
+def merge_units(words: list[dict], spans: list[list[int]]) -> list[dict]:
+    """Word intervals -> prosodic-unit intervals (outer edges of each span)."""
+    units = []
+    for k, span in enumerate(spans):
+        first, last = words[span[0]], words[span[-1]]
+        units.append({"word_idx": k, "word": " ".join(words[i]["word"] for i in span),
+                      "start_s": first["start_s"], "end_s": last["end_s"], "dur_s": last["end_s"] - first["start_s"],
+                      "pause_after_s": last["pause_after_s"], "n_phones": sum(words[i]["n_phones"] for i in span),
+                      "oov": any(words[i]["oov"] for i in span), "n_tokens": len(span)})
+    return units
+
+
+def sentence_units(grid: Path, text: str, audio_seconds: float | None = None) -> tuple[list[dict], bool]:
+    """(prosodic-unit intervals, mismatch). On a word-sequence mismatch the raw words are returned."""
+    words = word_intervals(grid, audio_seconds)
+    if [w["word"] for w in words] != [w for w, _ in tokens_with_punct(text)]:
+        return [{**w, "n_tokens": 1} for w in words], True
+    return merge_units(words, unit_spans(text)), False
 
 
 # ---------------------------------------------------------------- MFA
@@ -632,11 +756,75 @@ def _load_mono(path: Path, sr: int | None = None) -> tuple[np.ndarray, int]:
     try:
         audio, rate = sf.read(str(path), dtype="float32", always_2d=True)
         audio = audio.mean(axis=1)
-    except sf.LibsndfileError:  # mp3/m4a
-        audio, rate = librosa.load(str(path), sr=None, mono=True)
+    except sf.LibsndfileError:  # m4a/aac (and mp3 on older libsndfile): decode with ffmpeg
+        audio, rate = _ffmpeg_decode(Path(path))
     if sr and rate != sr:
         audio, rate = librosa.resample(audio, orig_sr=rate, target_sr=sr), sr
     return audio.astype(np.float32), int(rate)
+
+
+def _ffmpeg_decode(path: Path) -> tuple[np.ndarray, int]:
+    """Decode any ffmpeg-readable file to mono float32 at its native rate (falls back to librosa)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            audio, rate = librosa.load(str(path), sr=None, mono=True)
+            return audio.astype(np.float32), int(rate)
+        except Exception as exc:
+            raise RuntimeError(f"Cannot decode {path.name}: install ffmpeg, or convert it to WAV first.") from exc
+    with tempfile.TemporaryDirectory(prefix="naturalness_decode_") as folder:
+        out = Path(folder) / "decoded.wav"
+        proc = subprocess.run([ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", str(path), "-vn", "-ac", "1",
+                               "-c:a", "pcm_s16le", str(out)], capture_output=True, text=True, timeout=300)
+        if proc.returncode or not out.is_file():
+            raise RuntimeError(f"ffmpeg could not decode {path.name}: {proc.stderr.strip()[-300:]}")
+        audio, rate = sf.read(str(out), dtype="float32")
+    return np.asarray(audio, np.float32), int(rate)
+
+
+def _audio_info(path: Path) -> tuple[int, float]:
+    """(sample rate, seconds). soundfile reads WAV/FLAC/OGG headers; phone formats such as m4a/mp3
+    are decoded instead (needs ffmpeg), so they never crash the corpus check."""
+    try:
+        info = sf.info(str(path))
+        return int(info.samplerate), float(info.duration)
+    except (sf.LibsndfileError, RuntimeError):
+        audio, rate = _load_mono(Path(path))
+        return rate, len(audio) / rate
+
+
+def non_wav_recordings(corpus: "Corpus") -> list[Path]:
+    """Human stimulus recordings and cloning passages stored in a format other than WAV."""
+    out = []
+    for speaker in corpus.speakers():
+        for folder in (corpus.root / "speakers" / speaker / "stimuli", corpus.clone_dir(speaker)):
+            if folder.is_dir():
+                out += [p for p in sorted(folder.iterdir())
+                        if p.suffix.lower() in AUDIO_SUFFIXES and p.suffix.lower() != ".wav"]
+    return out
+
+
+def convert_recordings_to_wav(corpus: "Corpus", log=print) -> dict:
+    """Decode every non-WAV recording to 16-bit mono WAV at its own sample rate, next to the original
+    name, and move the original to speakers/<spk>/_original_audio/ (kept, never deleted).
+    Timing is unchanged, so existing alignments stay valid."""
+    converted, skipped = 0, []
+    for path in non_wav_recordings(corpus):
+        target = path.with_suffix(".wav")
+        if target.exists():
+            skipped.append(f"{path.name}: {target.name} already exists; left as is")
+            continue
+        audio, rate = _load_mono(path)
+        if not len(audio) or not np.isfinite(audio).all():
+            skipped.append(f"{path.name}: could not decode")
+            continue
+        sf.write(target, audio, rate, subtype="PCM_16")
+        keep = path.parents[1] / "_original_audio" / path.parent.name / path.name
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(keep))
+        converted += 1
+        log(f"converted {path.parent.name}/{path.name} -> {target.name}")
+    return {"converted": converted, "skipped": skipped}
 
 
 @dataclass
@@ -668,7 +856,7 @@ def alignment_items(corpus: Corpus, sources: list[str], force: bool = False) -> 
 def run_mfa_batch(items: list[AlignItem], dest: callable, acoustic: str = DEFAULT_ACOUSTIC,
                   dictionary: str | None = DEFAULT_DICTIONARY, command: str = "mfa", jobs: int = 2,
                   extra_args: list[str] | None = None, word_lexicon: str | Path | None = None,
-                  timeout_seconds: int = 3600, log=print) -> dict:
+                  timeout_seconds: int = 3600, log=print, lexicon_copy: Path | None = None) -> dict:
     """Align many (audio, transcript) pairs in ONE `mfa align` call. Each (source, speaker) is its own MFA
     speaker, so speaker adaptation never mixes human and machine audio. Every source gets identical
     settings and the same lexicon. dest(item) gives the TextGrid destination."""
@@ -697,6 +885,10 @@ def run_mfa_batch(items: list[AlignItem], dest: callable, acoustic: str = DEFAUL
             keys[(group, item.sentence_id)] = item
         lexicon = root / "lexicon.dict"
         missing = write_lexicon(vocabulary, phones, lexicon, overrides)
+        if lexicon_copy is not None:  # keep the exact pronunciations MFA used, for inspection
+            Path(lexicon_copy).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(lexicon, lexicon_copy)
+            Path(lexicon_copy).with_suffix(".phones.txt").write_text("\n".join(sorted(phones)) + "\n", encoding="utf-8")
         if missing:
             log(f"{len(missing)} word(s) have no akshara pronunciation and will align as OOV: {missing[:10]}")
         cmd = [executable, "align", str(corpus_dir), str(lexicon), str(acoustic), str(out_dir), "--clean",
@@ -734,6 +926,7 @@ def align_corpus(corpus: Corpus, sources: list[str], force: bool = False, **mfa)
     if not available:
         raise ValueError("No matching audio files were found for the selected alignment sources.")
     items = available if force else [i for i in available if not corpus.textgrid(i.source, i.speaker, i.sentence_id).is_file()]
+    mfa.setdefault("lexicon_copy", corpus.root / "alignments" / "_lexicon_used.dict")
     result = run_mfa_batch(items, lambda i: corpus.textgrid(i.source, i.speaker, i.sentence_id), **mfa)
     result["available"] = len(available)
     result["skipped_existing"] = len(available) - len(items)
@@ -749,6 +942,55 @@ def align_one(audio: np.ndarray, sr: int, transcript: str, **mfa) -> list[dict]:
         if not grid.is_file():
             raise RuntimeError("MFA could not align this file. " + "; ".join(result["failed"]))
         return word_intervals(grid, len(audio) / sr)
+
+
+def import_alignments(corpus: Corpus, source: str, folder: str | Path, force: bool = False) -> dict:
+    """Copy TextGrids made by another aligner (e.g. a colleague's MFA setup) into the corpus.
+
+    Expected names: <folder>/<speaker>/<sentence_id>.TextGrid (or <speaker>__<sentence_id>.TextGrid
+    flat in <folder>). Each grid must have a words tier whose word sequence equals the stimulus text
+    after the same normalization; otherwise it is rejected and listed, never silently used.
+    Use ONE aligner for every source you compare: human and machine timings from different aligners
+    are not comparable.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"{folder} is not a folder.")
+    if source != HUMAN and source != CLONE_REF:
+        _validate_id(source.replace("+", "_"), "Source")
+    texts, speakers = corpus.text_of(), set(corpus.speakers())
+    imported, rejected, skipped = 0, [], 0
+    for grid in sorted(folder.rglob("*.TextGrid")):
+        if grid.parent != folder:
+            speaker, sid = grid.parent.name, grid.stem
+        elif "__" in grid.stem:
+            speaker, sid = grid.stem.split("__", 1)
+        else:
+            rejected.append(f"{grid.name}: cannot tell the speaker (use <speaker>/<id>.TextGrid)")
+            continue
+        if speaker not in speakers:
+            rejected.append(f"{grid.name}: unknown speaker {speaker!r}")
+            continue
+        if sid not in texts:
+            rejected.append(f"{speaker}/{grid.name}: unknown sentence ID {sid!r}")
+            continue
+        try:
+            words = word_intervals(grid)
+        except Exception as exc:
+            rejected.append(f"{speaker}/{sid}: unreadable TextGrid ({type(exc).__name__}: {exc})")
+            continue
+        got, want = [w["word"] for w in words], [w for w, _ in tokens_with_punct(texts[sid])]
+        if [mfa_text(w) for w in got] != want:
+            rejected.append(f"{speaker}/{sid}: word tier does not match the stimulus text")
+            continue
+        target = corpus.textgrid(source, speaker, sid)
+        if target.is_file() and not force:
+            skipped += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(grid, target)
+        imported += 1
+    return {"imported": imported, "skipped_existing": skipped, "rejected": rejected}
 
 
 # ---------------------------------------------------------------- clone prompt
@@ -789,8 +1031,9 @@ def make_clone_prompt(corpus: Corpus, speaker: str, min_s: float = 6.0, max_s: f
 
 
 def build_durations(corpus: Corpus, sources: list[str] | None = None) -> pd.DataFrame:
-    """One row per aligned word per source. Flags: ok, short, long, oov, mismatch (MFA word
-    sequence differs from the stimulus), so bad alignments are excluded rather than averaged in."""
+    """One row per aligned prosodic unit (word + its enclitics, see ENCLITICS) per source. Flags: ok,
+    short, long, oov, mismatch (MFA word sequence differs from the stimulus), so bad alignments are
+    excluded rather than averaged in."""
     texts, splits = corpus.text_of(), corpus.splits()
     sources = sources or [HUMAN, *corpus.systems()]
     rows = []
@@ -801,19 +1044,22 @@ def build_durations(corpus: Corpus, sources: list[str] | None = None) -> pd.Data
                 if not grid.is_file():
                     continue
                 audio = corpus.audio(source, speaker, sid)
-                seconds = sf.info(str(audio)).duration if audio else None
-                expected = tokens_with_punct(text)
-                words = word_intervals(grid, seconds)
-                mismatch = [w["word"] for w in words] != [w for w, _ in expected]
+                seconds = _audio_info(audio)[1] if audio else None
+                words, mismatch = sentence_units(grid, text, seconds)
+                expected = unit_tokens(text)
                 n = len(words)
                 for w, (_, punct) in zip(words, expected if not mismatch else [("", "none")] * n):
-                    flag = ("mismatch" if mismatch else "oov" if w["oov"] else "short" if w["dur_s"] < MIN_WORD_S
-                            else "long" if w["dur_s"] > MAX_WORD_S else "ok")
+                    # Compare in whole milliseconds: TextGrid times are decimals, and 1.26 - 1.23 can come out
+                    # as 0.0299999, which flagged ~40% of words sitting exactly at MFA's 30 ms floor.
+                    dur_ms = round(w["dur_s"] * 1000, 1)
+                    long_ms = (MAX_WORD_S + LONG_PER_EXTRA_WORD_S * (w["n_tokens"] - 1)) * 1000
+                    flag = ("mismatch" if mismatch else "oov" if w["oov"] else "short" if dur_ms < MIN_WORD_S * 1000
+                            else "long" if dur_ms > long_ms else "ok")
                     rows.append({"source": source, "speaker": speaker, "sentence_id": sid,
                                  "split": corpus.split_of(speaker, sid, splits), **w,
                                  "n_words": n, "punct_after": punct, "flag": flag})
     columns = ["source", "speaker", "sentence_id", "split", "word_idx", "word", "start_s", "end_s",
-               "dur_s", "pause_after_s", "n_phones", "oov", "n_words", "punct_after", "flag"]
+               "dur_s", "pause_after_s", "n_phones", "oov", "n_tokens", "n_words", "punct_after", "flag"]
     frame = pd.DataFrame(rows, columns=columns)
     corpus.root.mkdir(parents=True, exist_ok=True)
     frame.to_csv(corpus.durations_csv, index=False, encoding="utf-8")
@@ -899,7 +1145,12 @@ def alignment_coverage(corpus: Corpus, sources: list[str] | None = None,
             "Alignment coverage (%)": 100 * aligned / expected if expected else float("nan"),
             "Aligned words": len(selected),
             "OOV words": int((selected.flag == "oov").sum()) if not selected.empty else 0,
-            "Other flagged words": int((selected.flag.isin(["short", "long", "mismatch"])).sum()) if not selected.empty else 0,
+            "Short words (<30 ms)": int((selected.flag == "short").sum()) if not selected.empty else 0,
+            "Long words (>1.5 s)": int((selected.flag == "long").sum()) if not selected.empty else 0,
+            "Mismatch words": int((selected.flag == "mismatch").sum()) if not selected.empty else 0,
+            "Collapsed (<25 ms/akshara) %": round(100 * float(
+                (selected.dur_s.astype(float) * 1000 / selected.n_phones.astype(float).clip(lower=1)
+                 < COLLAPSE_MS_PER_PHONE).mean()), 1) if not selected.empty else float("nan"),
             "Sentences with flagged words": int(bad[["speaker", "sentence_id"]].drop_duplicates().shape[0])
             if not bad.empty else 0,
         })
@@ -944,11 +1195,12 @@ def features(frame: pd.DataFrame, speaker_offset: dict | None = None, default_of
 class DurationModel:
     """Predicts log(human/machine) word duration and the human pause after each word.
 
-    word kinds: global (one rate factor), bucket (mean per syllables x position x punctuation),
+    word kinds: none (leave machine durations unchanged; the baseline every layer must beat),
+                global (one rate factor), bucket (mean per syllables x position x punctuation),
                 ridge, gbm.  pause kinds: keep (machine pauses), learned (P(pause) x size).
     """
 
-    WORD_KINDS = ("global", "bucket", "ridge", "gbm")
+    WORD_KINDS = ("none", "global", "bucket", "ridge", "gbm")
     PAUSE_KINDS = ("keep", "learned")
 
     def __init__(self, word_kind: str = "ridge", pause_kind: str = "learned", seed: int = 0):
@@ -994,12 +1246,16 @@ class DurationModel:
             self.pause_size_ = (make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-2, 3, 12))).fit(
                 xp[has], np.log(pause[has])) if has.sum() >= 5 else None)
             self.pause_median_ = float(np.median(pause[has])) if has.any() else 0.0
+            # Typical human gap between words that are NOT a pause (closures, micro-gaps).
+            self.short_gap_ = float(np.median(pause[~has])) if (~has).any() else 0.0
         return self
 
     def predict(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Columns pred_log_ratio, pred_dur_s, pred_pause_s for machine-aligned words."""
         x = features(frame, self.speaker_offset, self.default_offset)
-        if self.word_kind == "global":
+        if self.word_kind == "none":
+            log_ratio = np.zeros(len(x))
+        elif self.word_kind == "global":
             log_ratio = np.full(len(x), self.global_)
         elif self.word_kind == "bucket":
             log_ratio = self._bucket(frame, x).map(self.buckets_).fillna(self.global_).to_numpy()
@@ -1012,7 +1268,13 @@ class DurationModel:
                 xi = x[inner]
                 p = self.pause_clf_.predict_proba(xi)[:, 1] if self.pause_clf_ is not None else np.full(len(xi), self.pause_p_)
                 size = np.exp(self.pause_size_.predict(xi)) if self.pause_size_ is not None else np.full(len(xi), self.pause_median_)
-                pause[inner] = np.where(p >= 0.5, np.clip(size, PAUSE_MIN_S, MAX_PAUSE_S), 0.0)
+                # No pause predicted: keep the machine's micro-gap if it is already below the pause
+                # threshold, otherwise shrink it to the typical human non-pause gap. Setting it to 0
+                # would also delete natural closures between words.
+                machine_gap = pause[inner]
+                short = np.where(machine_gap < PAUSE_MIN_S, machine_gap,
+                                 getattr(self, "short_gap_", 0.0))
+                pause[inner] = np.where(p >= 0.5, np.clip(size, PAUSE_MIN_S, MAX_PAUSE_S), short)
         return pd.DataFrame({"pred_log_ratio": log_ratio, "pred_dur_s": frame.dur_s_m.to_numpy() * np.exp(log_ratio),
                              "pred_pause_s": pause}, index=frame.index)
 
@@ -1067,14 +1329,22 @@ def train_duration_model(pairs: pd.DataFrame, seed: int = 0) -> tuple[DurationMo
                          "machine_pause_rmse_ms": 1000 * _rmse(dev.pause_after_s_m[inner], dev.pause_after_s_h[inner])})
             models[(wk, pk)] = model
     report = pd.DataFrame(rows)
-    best_word = report.groupby("word_model").dev_log_rmse.min().idxmin()
-    best_pause = report[report.word_model == best_word].sort_values("dev_pause_rmse_ms").pause_model.iloc[0]
+    # Ties go to the simpler model: WORD_KINDS is ordered from simplest ("none") upwards.
+    order = {kind: i for i, kind in enumerate(DurationModel.WORD_KINDS)}
+    by_word = report.groupby("word_model").dev_log_rmse.min().round(6)
+    best_word = min(by_word.index, key=lambda k: (by_word[k], order[k]))
+    candidates = report[report.word_model == best_word]
+    pause_order = {kind: i for i, kind in enumerate(DurationModel.PAUSE_KINDS)}
+    best_pause = min(candidates.itertuples(),
+                     key=lambda r: (round(float(np.nan_to_num(r.dev_pause_rmse_ms, nan=np.inf)), 3),
+                                    pause_order[r.pause_model])).pause_model
     report["selected"] = (report.word_model == best_word) & (report.pause_model == best_pause)
     # Refit the chosen configuration on train + dev; the test split is still never seen.
     fit_on = pd.concat([train, dev])
     final = DurationModel(best_word, best_pause, seed).fit(fit_on)
     final.trained_on = {"words": len(fit_on), "sentences": int(fit_on.sentence_id.nunique()),
-                        "splits": ["train", "dev"], "speakers": sorted(fit_on.speaker.unique().tolist())}
+                        "splits": ["train", "dev"], "speakers": sorted(fit_on.speaker.unique().tolist()),
+                        "beats_no_correction_on_dev": bool(best_word != "none" or best_pause != "keep")}
     return final, report
 
 
@@ -1159,7 +1429,10 @@ def correct_system(corpus: Corpus, system: str, splits: tuple[str, ...] = ("dev"
             if not audio_path or not grid.is_file():
                 continue
             audio, sr = _load_mono(audio_path)
-            words = word_intervals(grid, len(audio) / sr)
+            words, mismatch = sentence_units(grid, texts[sid], len(audio) / sr)
+            if mismatch:
+                log(f"skip {speaker}/{sid}: machine alignment does not match the text")
+                continue
             if oracle:
                 rows = pairs[(pairs.speaker == speaker) & (pairs.sentence_id == sid)].sort_values("word_idx")
                 if len(rows) != len(words):
@@ -1213,6 +1486,8 @@ def _stock_tts(
     if system == "mms-tts-hin":
         audio, sr, _ = research.tts_mms(text, device=device)
     elif system == "maya2-native":
+        import torch
+        torch.manual_seed(research.TTS_SEED)  # Maya samples; a fixed seed keeps regenerations repeatable
         audio, sr, _ = research.tts_maya(text, voice=os.getenv("MAYA_VOICE", "Ahana"))
     else:
         raise ValueError(f"Unknown system {system}")
@@ -1249,6 +1524,8 @@ def generate(corpus: Corpus, system: str, splits: tuple[str, ...] = SPLITS, forc
             written += voice_clone.generate_batch(system.removeprefix("clone-"), str(prompt_wav),
                                                   prompt_txt.read_text(encoding="utf-8").strip(), jobs,
                                                   passage_wav=str(corpus.audio(CLONE_REF, spk, "passage") or prompt_wav),
+                                                  # "cpu" is the CLI/UI default, so treat it as "auto" (GPU when present)
+                                                  device=None if device == "cpu" else device,
                                                   log=log)
         return written
     mms_finetune_checkpoint = None
@@ -1495,14 +1772,16 @@ def build_listening_test(corpus: Corpus, systems: list[str], split: str = "test"
                     continue
                 trial = f"t{len(rows):04d}"
                 human_first = bool(rng.integers(0, 2))
-                clips = {}
-                for label, src, path in (("human", HUMAN, human), ("machine", system, machine)):
-                    clip = out / "clips" / f"{trial}_{label}.wav"
+                # Clip names carry only the A/B position, never "human"/"machine": the kit may be
+                # copied to listeners' machines, where a filename would give the answer away.
+                order = ((HUMAN, human), (system, machine)) if human_first else ((system, machine), (HUMAN, human))
+                names = []
+                for position, (src, path) in zip("AB", order):
+                    clip = out / "clips" / f"{trial}_{position}.wav"
                     sf.write(clip, _listening_clip(path, corpus.textgrid(src, speaker, sid)), LISTEN_SR, subtype="PCM_16")
-                    clips[label] = clip.name
-                a, b = ("human", "machine") if human_first else ("machine", "human")
+                    names.append(clip.name)
                 rows.append({"trial_id": trial, "speaker": speaker, "sentence_id": sid, "system": system,
-                             "clip_a": clips[a], "clip_b": clips[b], "human_is": "A" if human_first else "B"})
+                             "clip_a": names[0], "clip_b": names[1], "human_is": "A" if human_first else "B"})
     trials = pd.DataFrame(rows)
     trials.to_csv(out / "trials.csv", index=False)
     return trials
