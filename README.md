@@ -1,16 +1,3 @@
----
-title: Hindi Asr Tts
-emoji: 🚀
-colorFrom: red
-colorTo: red
-sdk: docker
-app_port: 7860
-tags:
-- streamlit
-pinned: false
-short_description: hindi-asr-tts
----
-
 # Hindi ASR → TTS Pipeline
 
 A Streamlit app for testing Hindi speech recognition (ASR) and speech synthesis (TTS), and for
