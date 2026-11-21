@@ -234,8 +234,7 @@ python tests/test_m4a.py
 
 ## Licences and consent
 
-- `facebook/mms-tts-hin` is CC-BY-NC 4.0 (non-commercial). Checkpoints fine-tuned from it carry
-  the same restriction.
+- `facebook/mms-tts-hin` is CC-BY-NC 4.0 (non-commercial). 
 - XTTS-v2 is under the non-commercial Coqui Public Model License.
 - IndicF5 and Koyal are gated on Hugging Face. Accept their terms before use.
 - Only clone the voice of someone who has given explicit permission. Speaker recordings are kept
